@@ -9,7 +9,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from orchestrator.unified_orchestrator import UnifiedOrchestrator
+from orchestrator.orchestrator import Orchestrator
 from ocr.ocr_module import OCRModule
 from llm.llm_agent import LLMAgent
 from db.db_module import DatabaseModule
@@ -36,7 +36,7 @@ class App(tk.Tk):
         self.classifier = ClassificationAgent(LLMClient())
         self.validator = ValidationAgent()
 
-        self.orchestrator = UnifiedOrchestrator(
+        self.orchestrator = Orchestrator(
             ocr_module=self.ocr,
             llm_agent=self.llm_agent,
             db_module=self.db,
@@ -49,6 +49,8 @@ class App(tk.Tk):
         self.current_image_tk = None
         self.rotation = 0
         self.current_result = None
+        self.current_parsed_list = []
+        self.current_page_index = 0
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
@@ -96,16 +98,35 @@ class App(tk.Tk):
         tk.Frame(left_frame, bg="#cccccc", height=2).pack(fill="x", padx=20, pady=10)
 
         self.btn_process = tk.Button(left_frame, text="ЗАПУСТИТЬ АНАЛИЗ", command=self.start_processing,
-                                     bg="#2e7d32", fg="#ffffff", font=("Arial", 12, "bold"),
+                                     bg="#2e7d32", fg="#000000", font=("Arial", 12, "bold"),
                                      padx=30, pady=10, relief="raised", bd=2, state="disabled")
         self.btn_process.pack(pady=15, padx=20, fill="x")
-
 
         right_frame = tk.Frame(self.tab_process, bg="#ffffff", relief="groove", bd=1)
         right_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
 
         tk.Label(right_frame, text="РЕЗУЛЬТАТ АНАЛИЗА", font=("Arial", 12, "bold"),
                  bg="#ffffff", fg="#000000").pack(pady=(15, 5))
+
+        nav_frame = tk.Frame(right_frame, bg="#ffffff")
+        nav_frame.pack(fill="x", padx=15, pady=(0, 5))
+
+        tk.Label(nav_frame, text="Страница / счёт:", bg="#ffffff", font=("Arial", 10)).pack(side="left", padx=(0, 10))
+
+        self.page_var = tk.StringVar(value="1")
+        self.page_spinbox = tk.Spinbox(nav_frame, from_=1, to=1, width=5,
+                                       textvariable=self.page_var,
+                                       command=self.on_page_change,
+                                       font=("Arial", 10))
+        self.page_spinbox.pack(side="left", padx=(0, 10))
+
+        self.total_pages_label = tk.Label(nav_frame, text="из 1", bg="#ffffff", font=("Arial", 10))
+        self.total_pages_label.pack(side="left")
+
+        self.btn_refresh_page = tk.Button(nav_frame, text="Обновить", command=self.on_page_change,
+                                          bg="#d9d9d9", fg="#000000", font=("Arial", 9),
+                                          padx=10, pady=2, relief="raised", bd=1)
+        self.btn_refresh_page.pack(side="right", padx=(10, 0))
 
         self.result_text = tk.Text(right_frame, wrap="word", font=("Courier New", 10),
                                    bg="#fafafa", fg="#000000", relief="sunken", bd=1)
@@ -118,7 +139,7 @@ class App(tk.Tk):
                  bg="#ffffff", fg="#000000").pack(anchor="w", padx=15, pady=(10, 5))
 
         self.log_text = tk.Text(bottom_frame, wrap="word", font=("Courier New", 9),
-                                bg="#f5f5f5", fg="#000000", relief="sunken", bd=1, height=6)
+                                bg="#f5f5f5", fg="#000000", relief="sunken", bd=1, height=30)
         self.log_text.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
         self.btn_export = tk.Button(bottom_frame, text="СОХРАНИТЬ КАК JSON", command=self.export_json,
@@ -249,19 +270,19 @@ class App(tk.Tk):
         finally:
             self.btn_process.config(state="normal", text="ЗАПУСТИТЬ АНАЛИЗ")
 
-    def show_result(self, result):
+    def display_parsed_item(self, parsed, index, total):
         self.result_text.delete("1.0", "end")
 
-        parsed = result.get('parsed', {})
-        category = result.get('category', {}).get('category', 'N/A')
-        validation = result.get('validation', {})
+        category = parsed.get('category', 'N/A')
+        validation_valid = parsed.get('validation_valid', False)
+        validation_errors = parsed.get('validation_errors', [])
 
         output = f"""
 ╔════════════════════════════════════════════════════════════════╗
-║                        РЕЗУЛЬТАТ АНАЛИЗА                       ║
+║                   РЕЗУЛЬТАТ АНАЛИЗА (стр. {index + 1} из {total})              ║
 ╚════════════════════════════════════════════════════════════════╝
 
-  Категория:      {category.upper()}
+  Категория:      {str(category).upper()}
   Сумма:          {parsed.get('total', 'N/A')} {parsed.get('currency', 'RUB')}
   Дата:           {parsed.get('date', 'N/A')}
   Компания:       {parsed.get('company', 'N/A')}
@@ -272,23 +293,60 @@ class App(tk.Tk):
 ║                           ВАЛИДАЦИЯ                            ║
 ╚════════════════════════════════════════════════════════════════╝
 
-  Статус:           {'ПРОЙДЕНА' if validation.get('valid') else '✗ НЕ ПРОЙДЕНА'}
+  Статус:           {'✓ ПРОЙДЕНА' if validation_valid else '✗ НЕ ПРОЙДЕНА'}
 
 """
-        if validation.get('errors'):
+        if validation_errors:
             output += "\n  Ошибки:\n"
-            for err in validation['errors']:
+            for err in validation_errors:
                 output += f"    • {err}\n"
 
-        output += f"""
-╔════════════════════════════════════════════════════════════════╗
-║                               ID                               ║
-╚════════════════════════════════════════════════════════════════╝
-
-  Документ ID:      {result.get('doc_id', 'N/A')}
-"""
-
         self.result_text.insert("1.0", output)
+
+    def on_page_change(self):
+        if not self.current_parsed_list:
+            return
+
+        try:
+            page_num = int(self.page_var.get())
+        except ValueError:
+            page_num = 1
+
+        total = len(self.current_parsed_list)
+        if page_num < 1:
+            page_num = 1
+        elif page_num > total:
+            page_num = total
+
+        self.page_var.set(str(page_num))
+        self.current_page_index = page_num - 1
+
+        self.display_parsed_item(
+            self.current_parsed_list[self.current_page_index],
+            self.current_page_index,
+            total
+        )
+
+    def show_result(self, result):
+        self.result_text.delete("1.0", "end")
+
+        parsed_list = result.get('parsed_list', [])
+        self.current_parsed_list = parsed_list
+        self.current_page_index = 0
+
+        total = len(parsed_list)
+
+        if total == 0:
+            self.result_text.insert("1.0", "Не удалось извлечь данные из документа")
+            self.page_spinbox.config(from_=1, to=1, state="disabled")
+            self.total_pages_label.config(text="из 1")
+            return
+
+        self.page_spinbox.config(from_=1, to=total, state="normal")
+        self.total_pages_label.config(text=f"из {total}")
+        self.page_var.set("1")
+
+        self.display_parsed_item(parsed_list[0], 0, total)
 
         self.log_text.delete("1.0", "end")
         for log in result.get('logs', []):
@@ -311,8 +369,14 @@ class App(tk.Tk):
                 initialfile=f"result_{self.current_result.get('doc_id', 'unknown')}.json"
             )
             if file_path:
+                export_data = {
+                    "doc_id": self.current_result.get('doc_id'),
+                    "filename": self.current_result.get('filename'),
+                    "parsed_list": self.current_result.get('parsed_list', []),
+                    "logs": self.current_result.get('logs', [])
+                }
                 with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.current_result, f, indent=2, ensure_ascii=False)
+                    json.dump(export_data, f, indent=2, ensure_ascii=False)
                 messagebox.showinfo("Успех", "Результат сохранён")
 
     def refresh_history(self):
@@ -325,8 +389,12 @@ class App(tk.Tk):
             data = self.db.get_one(doc_id)
             if data:
                 _, parsed = data
-                total = parsed.get('total', 'N/A')
-                category = parsed.get('category', 'N/A')
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    total = parsed[0].get('total', 'N/A')
+                    category = parsed[0].get('category', 'N/A')
+                else:
+                    total = parsed.get('total', 'N/A')
+                    category = parsed.get('category', 'N/A')
                 date_short = created_at[:10] if created_at else 'N/A'
                 self.history_tree.insert("", "end", values=(doc_id, filename, date_short, total, category))
 
@@ -342,13 +410,20 @@ class App(tk.Tk):
             _, parsed = data
             win = tk.Toplevel(self)
             win.title(f"Документ ID {doc_id} - Просмотр")
-            win.geometry("700x600")
+            win.geometry("800x600")
             win.configure(bg="#e0e0e0")
 
-            text = tk.Text(win, wrap="word", font=("Courier New", 10),
-                           bg="#ffffff", fg="#000000")
+            from tkinter import scrolledtext
+            text = scrolledtext.ScrolledText(win, wrap="word", font=("Courier New", 10),
+                                             bg="#ffffff", fg="#000000")
             text.pack(fill="both", expand=True, padx=10, pady=10)
-            text.insert("1.0", json.dumps(parsed, indent=2, ensure_ascii=False))
+
+            if isinstance(parsed, list):
+                output = json.dumps(parsed, indent=2, ensure_ascii=False)
+            else:
+                output = json.dumps(parsed, indent=2, ensure_ascii=False)
+
+            text.insert("1.0", output)
             text.config(state="disabled")
 
             tk.Button(win, text="ЗАКРЫТЬ", command=win.destroy,

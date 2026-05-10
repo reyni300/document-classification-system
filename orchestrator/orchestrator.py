@@ -14,7 +14,7 @@ with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
 
-class UnifiedOrchestrator:
+class Orchestrator:
     def __init__(self, ocr_module, llm_agent, db_module, classifier, validator,
                  translator_func=None):
         self.ocr = ocr_module
@@ -32,8 +32,9 @@ class UnifiedOrchestrator:
             logs.append(f"НАЧАЛО ОБРАБОТКИ: {filename}")
 
             logs.append("ШАГ 1: Предобработка изображения...")
-            processed_path = preprocess_image(file_path) if file_path.lower().endswith(('.png', '.jpg', '.jpeg')) else file_path
-            logs.append(f"Предобработка завершена")
+            processed_path = preprocess_image(file_path) if file_path.lower().endswith(
+                ('.png', '.jpg', '.jpeg')) else file_path
+            logs.append("Предобработка завершена")
 
             logs.append("ШАГ 2: Распознавание текста (OCR)...")
             ocr_data = self.ocr.extract(processed_path if processed_path else file_path)
@@ -65,85 +66,87 @@ class UnifiedOrchestrator:
                     page['text'] = normalize_data(page['text'])
 
             logs.append("ШАГ 5: LLM интерпретация (извлечение полей)...")
-            parsed = self.llm.interpret(ocr_data)
-            logs.append(f"Извлечены поля: {list(parsed.keys())}")
+            parsed_list = self.llm.interpret_multi(ocr_data)
+            logs.append(f"Извлечено записей: {len(parsed_list)}")
+
+            if not parsed_list:
+                raise ValueError("Не удалось извлечь данные из документа")
 
             for i, page in enumerate(ocr_data['pages']):
                 page['text'] = original_pages_text[i]
 
-            logs.append("ШАГ 6: Классификация категории расхода...")
-            data_for_classifier = {
-                "merchant": parsed.get('company', ''),
-                "items": [],
-                "total": parsed.get('total', 0),
-                "currency": parsed.get('currency', 'RUB'),
-                "date": parsed.get('date', '')
-            }
-            category_result = self.classifier.classify(data_for_classifier)
-            logs.append(f"Категория: {category_result.get('category', 'N/A')}")
-
-            if config['app'].get('enable_validation', True):
-                logs.append("ШАГ 7: Валидация данных...")
-
-                total_value = 0.0
-                if parsed.get('total'):
-                    try:
-                        total_str = str(parsed.get('total')).replace(',', '.')
-                        numbers = re.findall(r'[\d\.]+', total_str)
-                        if numbers:
-                            total_value = float(numbers[0])
-                    except:
-                        total_value = 0.0
-
-                date_value = parsed.get('date', '') or ''
-                currency_value = parsed.get('currency', 'RUB') or 'RUB'
-
-                validation_data = {
+            logs.append("ШАГ 6: Классификация и валидация...")
+            enriched_parsed_list = []
+            for idx, parsed in enumerate(parsed_list):
+                data_for_classifier = {
+                    "merchant": parsed.get('company', ''),
                     "items": [],
-                    "total": total_value,
-                    "currency": currency_value,
-                    "date": date_value
+                    "total": parsed.get('total', 0),
+                    "currency": parsed.get('currency', 'RUB'),
+                    "date": parsed.get('date', '')
                 }
+                category_result = self.classifier.classify(data_for_classifier)
 
-                validation = self.validator.validate(validation_data)
-                logs.append(f"Валидация: {'ПРОЙДЕНА' if validation['valid'] else 'НЕ ПРОЙДЕНА'}")
+                if config['app'].get('enable_validation', True):
+                    total_value = 0.0
+                    if parsed.get('total'):
+                        try:
+                            total_str = str(parsed.get('total')).replace(',', '.')
+                            numbers = re.findall(r'[\d\.]+', total_str)
+                            if numbers:
+                                total_value = float(numbers[0])
+                        except:
+                            total_value = 0.0
+
+                    date_value = parsed.get('date', '') or ''
+                    currency_value = parsed.get('currency', 'RUB') or 'RUB'
+
+                    validation_data = {
+                        "items": [],
+                        "total": total_value,
+                        "currency": currency_value,
+                        "date": date_value
+                    }
+                    validation = self.validator.validate(validation_data)
+                else:
+                    validation = {"valid": True, "errors": []}
+
+                enriched = parsed.copy()
+                enriched['category'] = category_result.get('category', 'прочее')
+                enriched['validation_valid'] = validation['valid']
                 if validation.get('errors'):
-                    for err in validation['errors']:
-                        logs.append(f"{err}")
-            else:
-                validation = {"valid": True, "errors": []}
-                logs.append("ШАГ 7: Валидация пропущена")
+                    enriched['validation_errors'] = validation['errors']
+                enriched_parsed_list.append(enriched)
 
-            logs.append("ШАГ 8: Сохранение в базу данных...")
+                logs.append(
+                    f"  Запись {idx + 1}: категория={enriched['category']}, валидация={'ПРОЙДЕНА' if validation['valid'] else 'НЕ ПРОЙДЕНА'}")
+
+            logs.append("ШАГ 7: Сохранение в базу данных...")
             ocr_version = ocr_data['ocr_engine']
             llm_version = config['llm'].get('version', config['llm']['model'])
-
-            parsed_with_category = parsed.copy()
-            parsed_with_category['category'] = category_result.get('category', 'прочее')
-            parsed_with_category['validation_valid'] = validation['valid']
-            if validation.get('errors'):
-                parsed_with_category['validation_errors'] = validation['errors']
 
             doc_id = self.db.save(
                 filename=filename,
                 ocr_text=full_ocr_text,
-                parsed_data=parsed_with_category,
+                parsed_data=enriched_parsed_list,
                 ocr_version=ocr_version,
                 llm_version=llm_version
             )
+
+            self.db.log_event(doc_id, "OCR_COMPLETE", f"Engine: {ocr_version}")
+            self.db.log_event(doc_id, "LLM_PARSE", f"Извлечено {len(parsed_list)} записей")
+            self.db.log_event(doc_id, "MULTI_PAGE", f"Документ содержит {len(parsed_list)} страниц/счетов")
 
             for log_msg in logs:
                 self.db.log_event(doc_id, "ОРКЕСТРАТОР", log_msg)
 
             logs.append(f"Сохранено в БД с ID: {doc_id}")
-            logs.append(f"ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО")
+            logs.append("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО")
 
             return {
                 "doc_id": doc_id,
                 "filename": filename,
-                "parsed": parsed,
-                "category": category_result,
-                "validation": validation,
+                "parsed_list": enriched_parsed_list,
                 "logs": logs,
                 "ocr_text_preview": full_ocr_text[:500]
             }
@@ -161,7 +164,5 @@ class UnifiedOrchestrator:
                 "filename": filename,
                 "error": str(e),
                 "logs": logs,
-                "parsed": {},
-                "category": {"category": "ошибка"},
-                "validation": {"valid": False, "errors": [str(e)]}
+                "parsed_list": []
             }

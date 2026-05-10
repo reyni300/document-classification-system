@@ -79,6 +79,7 @@ class InvoiceData(BaseModel):
             return ''
         v_str = str(v).strip()
         v_str = v_str.replace('"', '').replace('\n', ' ').strip()
+        v_str = re.sub(r'0+', 'О', v_str)
         v_str = v_str.replace('`', "'").replace('‘', "'").replace('’', "'")
         v_str = v_str.strip("'")
         return v_str
@@ -98,18 +99,73 @@ class InvoiceData(BaseModel):
 
 
 class LLMAgent:
-    def interpret(self, ocr_json):
-        # Объединяем текст со всех страниц
-        full_text = "\n\n".join(page['text'] for page in ocr_json['pages'])
+    def __init__(self):
+        self._last_ocr_hash = None
+        self._last_result = None
 
-        # Добавляем информацию о количестве страниц для контекста
-        if len(ocr_json['pages']) > 1:
-            full_text = f"[Документ содержит {len(ocr_json['pages'])} страниц]\n\n{full_text}"
+    def _get_ocr_hash(self, ocr_json):
+        import hashlib
+        text = ''.join([page['text'][:100] for page in ocr_json['pages']])
+        return hashlib.md5(text.encode()).hexdigest()
 
-        # В методе interpret замените prompt на русскоязычный:
+    def interpret_multi(self, ocr_json):
+
+        pages_text = [page['text'] for page in ocr_json['pages']]
+        num_pages = len(pages_text)
+
+        current_hash = self._get_ocr_hash(ocr_json)
+        if self._last_ocr_hash == current_hash:
+            print(f"DEBUG: Возвращаем кэшированный результат для {num_pages} страниц")
+            return self._last_result
+
+        print(f"DEBUG interpret_multi: {num_pages} страниц")
+
+        if num_pages == 0:
+            return []
+
+        if num_pages == 1:
+            result = self._extract_from_text(pages_text[0], full_text=pages_text[0], page_num=1)
+            final_result = [result] if result and "error" not in result else []
+        else:
+            all_results = []
+            for i, page_text in enumerate(pages_text):
+                has_invoice = re.search(r'СЧЕТ\s*НА\s*ОПЛАТУ|Счет\s*№|№\s*\d+', page_text, re.IGNORECASE)
+                if has_invoice:
+                    result = self._extract_from_text(page_text, full_text=page_text, page_num=i + 1)
+                    if result and "error" not in result:
+                        all_results.append(result)
+                else:
+                    if all_results and i > 0:
+                        combined_text = pages_text[i - 1] + "\n\n" + page_text
+                        result = self._extract_from_text(combined_text, full_text=combined_text, page_num=i)
+                        if result and "error" not in result and len(all_results) > 0:
+                            all_results[-1] = result
+
+            if not all_results:
+                combined_text = "\n\n".join(pages_text)
+                result = self._extract_from_text(combined_text, full_text=combined_text, page_num=1)
+                if result and "error" not in result:
+                    all_results = [result]
+
+            for i, result in enumerate(all_results):
+                result['_page'] = i + 1
+                result['_total_pages'] = len(all_results)
+
+            final_result = all_results
+
+        self._last_ocr_hash = current_hash
+        self._last_result = final_result
+
+        print(f"DEBUG: Извлечено {len(final_result)} записей из {num_pages} страниц")
+        return final_result
+
+    def _extract_from_text(self, page_text, full_text=None, page_num=1):
+        if full_text is None:
+            full_text = page_text
 
         prompt = f"""
-        Ты — строгий экстрактор данных из финансовых документов. Верни ТОЛЬКО валидный JSON. Без пояснений. Извлекай ТОЛЬКО следующие поля: date, total, currency, invoice_number, company, vat. Не добавляй другие поля.
+        Ты — строгий экстрактор данных из финансовых документов. Верни ТОЛЬКО валидный JSON. Без пояснений.
+        Извлекай ТОЛЬКО поля: date, total, currency, invoice_number, company, vat. Не добавляй другие поля.
 
         Важные указания:
         - date: дата в формате ДД.ММ.ГГГГ (день.месяц.год)
@@ -119,27 +175,20 @@ class LLMAgent:
         - company: название организации или магазина
         - vat: сумма НДС (если есть), иначе пустая строка
 
-        Примеры правильного извлечения:
-
-        Пример 1:
+        Примеры:
         Текст: "Счёт № 123 от 15.03.2024. Сумма: 5000.50 руб., НДС 1000.10 руб. Поставщик: ООО Ромашка"
         Вывод: {{"date": "15.03.2024", "total": "5000.50", "currency": "RUB", "invoice_number": "123", "company": "ООО Ромашка", "vat": "1000.10"}}
 
-        Пример 2:
-        Текст: "Счет-фактура № 789 от 12.11.2024 г. Итого к оплате: 120 000,00 рублей, в том числе НДС 20 000,00. Исполнитель: ООО Канапе"
-        Вывод: {{"date": "12.11.2024", "total": "120000.00", "currency": "RUB", "invoice_number": "789", "company": "ООО Канапе", "vat": "20000.00"}}
+        Текст: "Чек № 456 от 20.01.2024. Итого: 890.00 руб. Магазин: Пятёрочка"
+        Вывод: {{"date": "20.01.2024", "total": "890.00", "currency": "RUB", "invoice_number": "456", "company": "Пятёрочка", "vat": ""}}
 
-        Пример 3 (без НДС):
-        Текст: "Чек № 952993971 от 2021.06.15 17:46:11, сумма 60 BYN, магазин 'Друг садовода'"
-        Вывод: {{"date": "2021.06.15", "total": "60.00", "currency": "BYN", "invoice_number": "952993971", "company": "Друг садовода", "vat": ""}}
+        Теперь извлеки из следующего текста (страница {page_num}):
 
-        Теперь извлеки из следующего текста. Если какое-то поле отсутствует, верни пустую строку.
-
-        Текст:
         {full_text}
 
         Вывод (только JSON):
         """
+
         try:
             response = ollama.chat(
                 model=config['llm']['model'],
@@ -147,19 +196,49 @@ class LLMAgent:
                 options={'temperature': config['llm']['temperature']}
             )
         except Exception as e:
-            logging.error(f"Ollama error: {e}")
-            return {"error": "LLM request failed", "raw": str(e)}
+            logging.error(f"Ollama error on page {page_num}: {e}")
+            return None
 
         content = response['message']['content']
-        start = content.find('{')
-        end = content.rfind('}') + 1
-        if start == -1 or end == 0:
-            raise ValueError("No JSON object found in response")
-        json_str = content[start:end]
+        print(f"[LLM RAW OUTPUT page {page_num}]: {content[:100]}...")
+
+        first_brace = content.find('{')
+        last_brace = content.rfind('}')
+        if first_brace == -1 or last_brace == -1:
+            logging.error(f"No JSON found on page {page_num}")
+            return None
+
+        json_str = content[first_brace:last_brace + 1]
         json_str = clean_json_trailing_commas(json_str)
 
         try:
             data = json.loads(json_str)
+        except json.JSONDecodeError:
+            objects = []
+            brace_count = 0
+            start_idx = -1
+            for i, ch in enumerate(content):
+                if ch == '{':
+                    if brace_count == 0:
+                        start_idx = i
+                    brace_count += 1
+                elif ch == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_idx != -1:
+                        obj_str = content[start_idx:i + 1]
+                        try:
+                            obj_str_cleaned = clean_json_trailing_commas(obj_str)
+                            objects.append(json.loads(obj_str_cleaned))
+                        except:
+                            pass
+                        start_idx = -1
+            if objects:
+                data = objects[0]
+            else:
+                logging.error(f"Could not parse JSON on page {page_num}")
+                return None
+
+        try:
             validated = InvoiceData(**data)
             result = validated.dict()
 
@@ -187,8 +266,15 @@ class LLMAgent:
                 if match:
                     vat_str = match.group(1).replace(',', '.')
                     result['vat'] = vat_str
+
             return result
 
-        except (json.JSONDecodeError, ValueError) as e:
-            logging.error(f"JSON/decode error: {e}\nRaw: {json_str}")
-            return {"error": "Invalid JSON", "raw": json_str}
+        except Exception as e:
+            logging.error(f"Validation error on page {page_num}: {e}")
+            return None
+
+    def interpret(self, ocr_json):
+        result = self.interpret_multi(ocr_json)
+        if result and len(result) > 0:
+            return result[0]
+        return {"error": "No data extracted"}
