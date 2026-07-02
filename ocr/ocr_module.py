@@ -4,9 +4,15 @@ import pytesseract
 from pdf2image import convert_from_path
 from datetime import datetime
 import yaml
+import os
+import tempfile
 
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
+
+# Папка для хранения конвертированных страниц PDF
+PDF_PAGES_DIR = os.path.join(tempfile.gettempdir(), "dokanaliz_pages")
+os.makedirs(PDF_PAGES_DIR, exist_ok=True)
 
 class OCRModule:
     def preprocess(self, img):
@@ -26,9 +32,16 @@ class OCRModule:
         lang = config['ocr']['lang']
 
         if file_path.lower().endswith(".pdf"):
-            images = convert_from_path(file_path)
-            for page_num, img in enumerate(images):
-                img_np = np.array(img)
+            # Конвертируем PDF в изображения с высоким DPI для качественного OCR
+            images = convert_from_path(file_path, dpi=300)
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+
+            for page_num, img_pil in enumerate(images):
+                # Сохраняем PNG-версию страницы для предпросмотра в браузере
+                png_path = os.path.join(PDF_PAGES_DIR, f"{base_name}_page{page_num + 1}.png")
+                img_pil.save(png_path, "PNG")
+
+                img_np = np.array(img_pil)
                 processed = self.preprocess(img_np)
                 data = pytesseract.image_to_data(processed, lang=lang, output_type=pytesseract.Output.DICT)
                 text = pytesseract.image_to_string(processed, lang=lang)
@@ -48,7 +61,10 @@ class OCRModule:
                 all_pages.append({
                     "page": page_num + 1,
                     "text": text,
-                    "blocks": blocks
+                    "blocks": blocks,
+                    "png_path": png_path,          # путь к PNG для отдачи браузеру
+                    "img_width": img_pil.width,    # реальные размеры PNG
+                    "img_height": img_pil.height
                 })
         else:
             img = cv2.imread(file_path)
@@ -73,7 +89,10 @@ class OCRModule:
             all_pages.append({
                 "page": 1,
                 "text": text,
-                "blocks": blocks
+                "blocks": blocks,
+                "png_path": file_path,
+                "img_width": img.shape[1],
+                "img_height": img.shape[0]
             })
 
         return {

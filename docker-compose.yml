@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  # Наш курсач
+  app:
+    build: .
+    image: doc-classifier
+    network_mode: "host" # Чтобы графика и сеть работали без проблем
+    environment:
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ./db:/app/db
+      - ./test_files:/app/test_files
+    depends_on:
+      - ollama
+
+  # Сервер Ollama
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
+volumes:
+  ollama_data:

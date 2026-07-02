@@ -59,11 +59,20 @@ class Orchestrator:
                 logs.append("ШАГ 4: Перевод отключён")
 
             original_pages_text = [page['text'] for page in ocr_data['pages']]
+
+            # Нормализуем OCR-артефакты валют прямо в тексте страниц до подачи в LLM
+            currency_ocr_fixes = {
+                r'\bВУМ\b': 'BYN', r'\bВУН\b': 'BYN', r'\bBУМ\b': 'BYN',
+                r'\bВВМ\b': 'BYN', r'\bBYR\b': 'BYN', r'\bBUM\b': 'BYN',
+            }
             for i, page in enumerate(ocr_data['pages']):
+                text = page['text']
+                for pattern, replacement in currency_ocr_fixes.items():
+                    text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
                 if self.translator:
-                    page['text'] = self.translator(page['text'])
+                    page['text'] = self.translator(text)
                 else:
-                    page['text'] = normalize_data(page['text'])
+                    page['text'] = normalize_data(text)
 
             logs.append("ШАГ 5: LLM интерпретация (извлечение полей)...")
             parsed_list = self.llm.interpret_multi(ocr_data)

@@ -4,7 +4,7 @@ import re
 import yaml
 import ollama
 from pydantic import BaseModel, validator
-from typing import Optional
+from typing import Optional, Dict
 
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
@@ -23,6 +23,8 @@ class InvoiceData(BaseModel):
     invoice_number: Optional[str] = None
     company: Optional[str] = None
     vat: Optional[str] = None
+    document_type: Optional[str] = None      # тип документа (чек, квитанция, счёт и т.д.)
+    extra_fields: Optional[Dict] = None      # любые дополнительные поля которые нашёл LLM
 
     @validator('total', pre=True)
     def normalize_total(cls, v):
@@ -53,15 +55,22 @@ class InvoiceData(BaseModel):
         if v is None or v == '':
             return 'RUB'
         v_str = str(v).strip().upper()
+
         if v_str in ['RUB', 'USD', 'EUR', 'BYN']:
             return v_str
-        if v_str in ['РУБ', 'Р', 'РУБЛЬ', 'РУБЛЕЙ']:
+        if v_str in ['РУБ', 'Р', 'РУБЛЬ', 'РУБЛЕЙ', 'RUR']:
             return 'RUB'
-        if v_str in ['USD', '$', 'ДОЛЛ', 'ДОЛЛАР']:
+        if v_str in ['$', 'ДОЛЛ', 'ДОЛЛАР', 'DOLLARS']:
             return 'USD'
-        if v_str in ['EUR', '€', 'ЕВРО']:
+        if v_str in ['€', 'ЕВРО', 'EURO']:
             return 'EUR'
-        if v_str in ['BYN', 'БЕЛ', 'БЕЛРУБ', 'Б.Р.']:
+        if v_str in [
+            'BYN', 'BYR',
+            'ВУМ', 'ВУН', 'BУМ', 'BУН',
+            'VUM', 'VUN', 'BUM', 'BUN',
+            'БЕЛ', 'БЕЛРУБ', 'Б.Р.', 'БР',
+            'БЕЛОРУССКИЙ', 'BEL',
+        ]:
             return 'BYN'
         return 'RUB'
 
@@ -80,7 +89,7 @@ class InvoiceData(BaseModel):
         v_str = str(v).strip()
         v_str = v_str.replace('"', '').replace('\n', ' ').strip()
         v_str = re.sub(r'0+', 'О', v_str)
-        v_str = v_str.replace('`', "'").replace('‘', "'").replace('’', "'")
+        v_str = v_str.replace('`', "'").replace('\u2018', "'").replace('\u2019', "'")
         v_str = v_str.strip("'")
         return v_str
 
@@ -97,6 +106,50 @@ class InvoiceData(BaseModel):
         except:
             return v_str
 
+    @validator('document_type', pre=True)
+    def normalize_document_type(cls, v):
+        if v is None:
+            return None
+        return str(v).strip()
+
+    @validator('extra_fields', pre=True)
+    def normalize_extra_fields(cls, v):
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            return {}
+
+        # Словарь нормализации валют — те же варианты что и в normalize_currency
+        currency_map = {
+            'ВУМ': 'BYN', 'ВУН': 'BYN', 'BУМ': 'BYN', 'BУН': 'BYN',
+            'VUM': 'BYN', 'VUN': 'BYN', 'BUM': 'BYN', 'BUN': 'BYN',
+            'БЕЛ': 'BYN', 'БЕЛРУБ': 'BYN', 'Б.Р.': 'BYN', 'БР': 'BYN',
+            'БЕЛОРУССКИЙ': 'BYN', 'BEL': 'BYN', 'BYR': 'BYN',
+            'РУБ': 'RUB', 'РУБЛЬ': 'RUB', 'РУБЛЕЙ': 'RUB', 'RUR': 'RUB',
+        }
+
+        def fix_currency_in_value(val_str):
+            """Исправляет OCR-артефакты валюты внутри строки значения."""
+            for wrong, correct in currency_map.items():
+                # Заменяем как отдельное слово (с границами)
+                val_str = re.sub(
+                    r'(?<![А-Яа-яA-Za-z])' + re.escape(wrong) + r'(?![А-Яа-яA-Za-z])',
+                    correct, val_str
+                )
+            return val_str
+
+        cleaned = {}
+        for key, val in v.items():
+            if val is None:
+                continue
+            val_str = str(val).strip()
+            if val_str in ('', 'N/A', 'null', 'None', '-'):
+                continue
+            val_str = fix_currency_in_value(val_str)
+            cleaned_key = str(key).strip().replace('_', ' ').capitalize()
+            cleaned[cleaned_key] = val_str
+        return cleaned
+
 
 class LLMAgent:
     def __init__(self):
@@ -109,7 +162,6 @@ class LLMAgent:
         return hashlib.md5(text.encode()).hexdigest()
 
     def interpret_multi(self, ocr_json):
-
         pages_text = [page['text'] for page in ocr_json['pages']]
         num_pages = len(pages_text)
 
@@ -155,7 +207,6 @@ class LLMAgent:
 
         self._last_ocr_hash = current_hash
         self._last_result = final_result
-
         print(f"DEBUG: Извлечено {len(final_result)} записей из {num_pages} страниц")
         return final_result
 
@@ -164,30 +215,36 @@ class LLMAgent:
             full_text = page_text
 
         prompt = f"""
-        Ты — строгий экстрактор данных из финансовых документов. Верни ТОЛЬКО валидный JSON. Без пояснений.
-        Извлекай ТОЛЬКО поля: date, total, currency, invoice_number, company, vat. Не добавляй другие поля.
+Ты — экстрактор данных из финансовых документов. Верни ТОЛЬКО валидный JSON. Без пояснений, без markdown.
 
-        Важные указания:
-        - date: дата в формате ДД.ММ.ГГГГ (день.месяц.год)
-        - total: итоговая сумма (строка, например "12000.50")
-        - currency: код валюты (RUB, USD, EUR, BYN)
-        - invoice_number: номер счёта или чека
-        - company: название организации или магазина
-        - vat: сумма НДС (если есть), иначе пустая строка
+Обязательные поля (если не найдено — null):
+- date: дата документа в формате ДД.ММ.ГГГГ
+- total: итоговая сумма строкой, например "258.00"
+- currency: код валюты — ТОЛЬКО одно из: RUB, USD, EUR, BYN
+- invoice_number: номер чека, счёта, квитанции
+- company: название организации, магазина или получателя платежа
+- vat: сумма НДС строкой, если есть, иначе null
+- document_type: тип документа одним словом или коротко, например: "Кассовый чек", "Банковская квитанция", "Счёт-фактура", "Товарный чек", "Платёжное поручение"
 
-        Примеры:
-        Текст: "Счёт № 123 от 15.03.2024. Сумма: 5000.50 руб., НДС 1000.10 руб. Поставщик: ООО Ромашка"
-        Вывод: {{"date": "15.03.2024", "total": "5000.50", "currency": "RUB", "invoice_number": "123", "company": "ООО Ромашка", "vat": "1000.10"}}
+Дополнительное поле extra_fields — словарь с ЛЮБЫМИ важными данными которые ты нашёл в документе.
+Включай в extra_fields всё значимое: плательщик, получатель, банк, назначение платежа, номер карты, номер телефона, адрес, артикулы товаров, количество позиций, скидка, бонусы, кассир, терминал, номер ЕРИП, код авторизации и т.д.
+НЕ включай в extra_fields то что уже есть в основных полях (date, total, currency, invoice_number, company, vat).
+Если дополнительных данных нет — extra_fields: {{}}.
 
-        Текст: "Чек № 456 от 20.01.2024. Итого: 890.00 руб. Магазин: Пятёрочка"
-        Вывод: {{"date": "20.01.2024", "total": "890.00", "currency": "RUB", "invoice_number": "456", "company": "Пятёрочка", "vat": ""}}
+Примеры:
 
-        Теперь извлеки из следующего текста (страница {page_num}):
+Текст: "Чек №456 от 20.01.2024. Магазин Пятёрочка. Итого: 890.00 руб. Кассир: Анна. Товаров: 5"
+Вывод: {{"date":"20.01.2024","total":"890.00","currency":"RUB","invoice_number":"456","company":"Пятёрочка","vat":null,"document_type":"Кассовый чек","extra_fields":{{"Кассир":"Анна","Количество товаров":"5"}}}}
 
-        {full_text}
+Текст: "Приорбанк. Вывоз мусора. Плательщик: Иван Иванов. Сумма 258 BYN. Получатель: Датком Столица. Номер ЕРИП: 7788888. Код авторизации: 542121"
+Вывод: {{"date":null,"total":"258.00","currency":"BYN","invoice_number":null,"company":"Датком Столица","vat":null,"document_type":"Банковская квитанция","extra_fields":{{"Плательщик":"Иван Иванов","Банк":"Приорбанк","Услуга":"Вывоз мусора","Номер ЕРИП":"7788888","Код авторизации":"542121"}}}}
 
-        Вывод (только JSON):
-        """
+Теперь извлеки из следующего текста (страница {page_num}):
+
+{full_text}
+
+Вывод (только JSON):
+"""
 
         try:
             response = ollama.chat(
@@ -200,7 +257,7 @@ class LLMAgent:
             return None
 
         content = response['message']['content']
-        print(f"[LLM RAW OUTPUT page {page_num}]: {content[:100]}...")
+        print(f"[LLM RAW OUTPUT page {page_num}]: {content[:200]}...")
 
         first_brace = content.find('{')
         last_brace = content.rfind('}')
@@ -242,6 +299,7 @@ class LLMAgent:
             validated = InvoiceData(**data)
             result = validated.dict()
 
+            # Фолбэки если LLM не нашёл — ищем регулярками
             if not result.get('invoice_number'):
                 match = re.search(r'(?:№|Номер)\s*[:]?\s*([0-9\-]+)', full_text)
                 if match:
@@ -249,7 +307,7 @@ class LLMAgent:
 
             if not result.get('company'):
                 patterns = [
-                    r'(?:Поставщик|Исполнитель|Продавец)\s*[:]?\s*([А-Яа-я0-9\s\-\"\'\,\(\)]+?)(?:\n|,|$)',
+                    r'(?:Поставщик|Исполнитель|Продавец|Получатель платежа)\s*[:]?\s*([А-Яа-я0-9\s\-\"\'\,\(\)]+?)(?:\n|,|$)',
                     r'(?:ООО|ЗАО|АО|ИП|ЧУП|ОАО|ПАО)\s+[А-Яа-я0-9\s\-\"\']+',
                 ]
                 for pat in patterns:

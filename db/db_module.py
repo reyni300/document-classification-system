@@ -4,7 +4,7 @@ from datetime import datetime
 
 class DatabaseModule:
     def __init__(self, db_file="documents.db"):
-        self.conn = sqlite3.connect(db_file)
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.create_tables()
 
     def create_tables(self):

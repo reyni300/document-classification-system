@@ -81,4 +81,4 @@ curl -fsSL https://ollama.com/install.sh | sh
 ollama pull mistral
 
 # 5. Запустить приложение
-python main.py
+python main.py# document-classification-system
