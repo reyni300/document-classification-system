@@ -1,0 +1,3296 @@
+=== FILE: ./config.yaml ===
+ocr:
+  lang: "rus+eng"
+  preprocessing:
+    alpha: 1.5
+    adaptive_block_size: 11
+    adaptive_constant: 2
+
+llm:
+  model: "mistral"
+  temperature: 0.1
+  version: "mistral:latest"
+
+database:
+  file: "documents.db"
+
+app:
+  theme: "dark"
+  show_translation: true
+  enable_validation: true
+
+=== FILE: ./web_server.py ===
+"""
+web_server.py — Flask-сервер для веб-интерфейса ДокАнализ
+Запуск: python web_server.py
+Открыть:  http://localhost:5000
+"""
+
+import os
+import sys
+import json
+import re
+import tempfile
+from flask import Flask, request, jsonify, send_from_directory
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from orchestrator.orchestrator import Orchestrator
+from ocr.ocr_module import OCRModule
+from llm.llm_agent import LLMAgent
+from db.db_module import DatabaseModule
+from agents.classification_agent import ClassificationAgent
+from agents.validation_agent import ValidationAgent
+from llm.llm_client import LLMClient
+from translation.translator import translate_field
+import yaml
+
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+ocr       = OCRModule()
+llm_agent = LLMAgent()
+db        = DatabaseModule(config['database']['file'])
+classifier = ClassificationAgent(LLMClient())
+validator  = ValidationAgent()
+
+orchestrator = Orchestrator(
+    ocr_module=ocr,
+    llm_agent=llm_agent,
+    db_module=db,
+    classifier=classifier,
+    validator=validator,
+    translator_func=translate_field if config['app'].get('show_translation', True) else None
+)
+
+app = Flask(__name__, static_folder='.', static_url_path='')
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'pdf'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def normalize_for_search(text):
+    """Нормализует строку для нечёткого сравнения."""
+    if not text:
+        return ''
+    text = str(text).lower().strip()
+    text = re.sub(r'[^\w\d]', '', text)
+    return text
+
+
+def find_blocks_for_value(blocks, value):
+    """
+    Ищет OCR-блоки, соответствующие извлечённому значению.
+    Возвращает список блоков с координатами.
+    """
+    if not value or not blocks:
+        return []
+
+    value_str = str(value).strip()
+    norm_value = normalize_for_search(value_str)
+
+    if not norm_value or len(norm_value) < 2:
+        return []
+
+    matched = []
+
+    # 1. Точное совпадение нормализованного текста блока
+    for block in blocks:
+        norm_block = normalize_for_search(block.get('text', ''))
+        if norm_block and norm_value in norm_block:
+            matched.append(block)
+
+    if matched:
+        return matched
+
+    # 2. Нечёткий поиск: разбиваем значение на части и ищем по словам
+    # Например "7260.00" -> ищем "7260", "7.260", "7 260" и т.д.
+    # Убираем незначимые нули и знаки
+    value_parts = re.findall(r'\d+', norm_value)
+    if value_parts:
+        main_number = value_parts[0]  # главное число
+        if len(main_number) >= 3:
+            for block in blocks:
+                norm_block = normalize_for_search(block.get('text', ''))
+                if main_number in norm_block:
+                    matched.append(block)
+
+    if matched:
+        return matched
+
+    # 3. Поиск по первым значимым символам (для компаний, дат и т.д.)
+    # Берём первые 4+ символа и ищем
+    if len(norm_value) >= 4:
+        prefix = norm_value[:4]
+        for block in blocks:
+            norm_block = normalize_for_search(block.get('text', ''))
+            if norm_block and prefix in norm_block:
+                matched.append(block)
+
+    return matched
+
+
+def build_field_mapping(parsed_item, blocks):
+    """
+    Для каждого поля из parsed_item находит соответствующие OCR-блоки.
+    Возвращает dict: { field_name: [{ text, left, top, width, height, confidence }] }
+    """
+    fields_to_map = ['total', 'date', 'company', 'invoice_number', 'vat', 'currency']
+    mapping = {}
+
+    # Основные поля
+    for field in fields_to_map:
+        value = parsed_item.get(field)
+        if value and str(value).strip() and str(value).strip() not in ('N/A', 'None', ''):
+            found_blocks = find_blocks_for_value(blocks, value)
+            if found_blocks:
+                mapping[field] = found_blocks
+
+    # extra_fields — ключ формата "extra::<название поля>"
+    extra = parsed_item.get('extra_fields') or {}
+    for label, value in extra.items():
+        if value and str(value).strip() not in ('N/A', 'None', '', '-'):
+            found_blocks = find_blocks_for_value(blocks, value)
+            if found_blocks:
+                mapping[f'extra::{label}'] = found_blocks
+
+    return mapping
+
+
+@app.route('/')
+def index():
+    return send_from_directory('.', 'index.html')
+
+
+@app.route('/api/process', methods=['POST'])
+def process_document():
+    if 'file' not in request.files:
+        return jsonify({'error': 'Файл не передан'}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'Имя файла пустое'}), 400
+    if not allowed_file(file.filename):
+        return jsonify({'error': f'Формат не поддерживается: {file.filename}'}), 400
+
+    suffix = '.' + file.filename.rsplit('.', 1)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        file.save(tmp.name)
+        tmp_path = tmp.name
+
+    try:
+        # Сбрасываем кэш LLM перед каждым новым файлом
+        llm_agent._last_ocr_hash = None
+        llm_agent._last_result = None
+
+        # Получаем OCR-блоки ДО оркестратора, пока файл точно на диске
+        try:
+            ocr_data_for_mapping = ocr.extract(tmp_path)
+            pages_blocks = [page.get('blocks', []) for page in ocr_data_for_mapping.get('pages', [])]
+        except Exception:
+            pages_blocks = []
+
+        # Сбрасываем кэш снова — чтобы оркестратор запустил LLM заново,
+        # а не вернул кэш от вызова выше
+        llm_agent._last_ocr_hash = None
+        llm_agent._last_result = None
+
+        # Запускаем основную обработку
+        result = orchestrator.process_document(tmp_path, file.filename)
+
+        # Строим маппинг для каждой записи в parsed_list
+        parsed_list = result.get('parsed_list', [])
+        field_mappings = []
+
+        for idx, parsed_item in enumerate(parsed_list):
+            # Определяем страницу для этой записи
+            page_idx = parsed_item.get('_page', idx + 1) - 1
+            blocks = pages_blocks[page_idx] if page_idx < len(pages_blocks) else \
+                     (pages_blocks[0] if pages_blocks else [])
+
+            mapping = build_field_mapping(parsed_item, blocks)
+            field_mappings.append(mapping)
+
+        # Добавляем блоки страниц и маппинг в результат
+        result['pages_blocks'] = pages_blocks
+        result['field_mappings'] = field_mappings
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'filename': file.filename,
+            'parsed_list': [],
+            'logs': [],
+            'pages_blocks': [],
+            'field_mappings': []
+        }), 500
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    docs = db.get_all()
+    result = []
+    for doc_id, filename, created_at in docs:
+        row = db.get_one(doc_id)
+        total, currency, category = '—', '', 'прочее'
+        if row:
+            _, parsed = row
+            first = parsed[0] if isinstance(parsed, list) and parsed else parsed
+            if isinstance(first, dict):
+                total    = first.get('total', '—')
+                currency = first.get('currency', '')
+                category = first.get('category', 'прочее')
+        result.append({
+            'id':       doc_id,
+            'filename': filename,
+            'date':     (created_at or '')[:10],
+            'total':    total,
+            'currency': currency,
+            'category': category,
+        })
+    return jsonify(result)
+
+
+@app.route('/api/document/<int:doc_id>', methods=['GET'])
+def get_document(doc_id):
+    data = db.get_one(doc_id)
+    if not data:
+        return jsonify({'error': 'Документ не найден'}), 404
+    ocr_text, parsed = data
+    docs = db.get_all()
+    filename = next((f for did, f, _ in docs if did == doc_id), '')
+    return jsonify({'doc_id': doc_id, 'filename': filename, 'ocr_text': ocr_text, 'parsed': parsed})
+
+
+@app.route('/api/document/<int:doc_id>', methods=['DELETE'])
+def delete_document(doc_id):
+    db.delete(doc_id)
+    return jsonify({'ok': True})
+
+
+if __name__ == '__main__':
+    print("=" * 50)
+    print("  ДокАнализ — Веб-сервер")
+    print("  http://localhost:5000")
+    print("=" * 50)
+    app.run(debug=True, host='0.0.0.0', port=5000)
+
+
+=== FILE: ./llm/llm_client.py ===
+import json
+import requests
+
+
+class LLMClient:
+    def __init__(self, model="mistral"):
+        self.model = model
+        self.url = "http://localhost:11434/api/generate"
+
+    def generate(self, prompt: str):
+        try:
+            response = requests.post(
+                self.url,
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json"
+                },
+                timeout=120
+            )
+
+            response.raise_for_status()
+            data = response.json()
+
+            if "response" not in data:
+                print("ERROR RESPONSE:", data)
+                return {"category": "прочее"}
+
+            result = data["response"]
+            print("\n[LLM RAW OUTPUT]:", result)
+
+            return self.clean_json(result)
+
+        except Exception as e:
+            print("LLM ERROR:", e)
+            return {"category": "прочее"}
+
+    def clean_json(self, text: str):
+        try:
+            return json.loads(text)
+        except Exception:
+            start = text.find("{")
+            end = text.rfind("}")
+
+            if start != -1 and end != -1:
+                try:
+                    return json.loads(text[start:end + 1])
+                except Exception:
+                    pass
+
+            return {"category": "прочее"}
+
+=== FILE: ./llm/llm_agent.py ===
+import json
+import logging
+import re
+import yaml
+import ollama
+from pydantic import BaseModel, validator
+from typing import Optional, Dict
+
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+
+def clean_json_trailing_commas(json_str):
+    json_str = re.sub(r',\s*}', '}', json_str)
+    json_str = re.sub(r',\s*]', ']', json_str)
+    return json_str
+
+
+class InvoiceData(BaseModel):
+    date: Optional[str] = None
+    total: Optional[str] = None
+    currency: str = "RUB"
+    invoice_number: Optional[str] = None
+    company: Optional[str] = None
+    vat: Optional[str] = None
+    document_type: Optional[str] = None      # тип документа (чек, квитанция, счёт и т.д.)
+    extra_fields: Optional[Dict] = None      # любые дополнительные поля которые нашёл LLM
+
+    @validator('total', pre=True)
+    def normalize_total(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return f"{v:.2f}"
+        v_str = str(v).strip()
+        v_str = v_str.replace(' ', '').replace(',', '.')
+        v_str = re.sub(r'[^\d.-]', '', v_str)
+        try:
+            return f"{float(v_str):.2f}"
+        except ValueError:
+            return None
+
+    @validator('date', pre=True)
+    def normalize_date(cls, v):
+        if v is None:
+            return None
+        v_str = str(v).strip()
+        if ' ' in v_str:
+            v_str = v_str.split()[0]
+        v_str = v_str.replace(' г.', '').strip()
+        return v_str
+
+    @validator('currency', pre=True)
+    def normalize_currency(cls, v):
+        if v is None or v == '':
+            return 'RUB'
+        v_str = str(v).strip().upper()
+
+        if v_str in ['RUB', 'USD', 'EUR', 'BYN']:
+            return v_str
+        if v_str in ['РУБ', 'Р', 'РУБЛЬ', 'РУБЛЕЙ', 'RUR']:
+            return 'RUB'
+        if v_str in ['$', 'ДОЛЛ', 'ДОЛЛАР', 'DOLLARS']:
+            return 'USD'
+        if v_str in ['€', 'ЕВРО', 'EURO']:
+            return 'EUR'
+        if v_str in [
+            'BYN', 'BYR',
+            'ВУМ', 'ВУН', 'BУМ', 'BУН',
+            'VUM', 'VUN', 'BUM', 'BUN',
+            'БЕЛ', 'БЕЛРУБ', 'Б.Р.', 'БР',
+            'БЕЛОРУССКИЙ', 'BEL',
+        ]:
+            return 'BYN'
+        return 'RUB'
+
+    @validator('invoice_number', pre=True)
+    def normalize_number(cls, v):
+        if v is None:
+            return ''
+        v_str = str(v).strip()
+        v_str = re.sub(r'[^\w\-]', '', v_str)
+        return v_str
+
+    @validator('company', pre=True)
+    def normalize_company(cls, v):
+        if v is None:
+            return ''
+        v_str = str(v).strip()
+        v_str = v_str.replace('"', '').replace('\n', ' ').strip()
+        v_str = re.sub(r'0+', 'О', v_str)
+        v_str = v_str.replace('`', "'").replace('\u2018', "'").replace('\u2019', "'")
+        v_str = v_str.strip("'")
+        return v_str
+
+    @validator('vat', pre=True)
+    def normalize_vat(cls, v):
+        if v is None or v == '':
+            return ''
+        v_str = str(v).strip()
+        v_str = re.sub(r'НДС\s*', '', v_str, flags=re.IGNORECASE)
+        v_str = v_str.replace(' ', '').replace(',', '.')
+        v_str = re.sub(r'[^\d.-]', '', v_str)
+        try:
+            return f"{float(v_str):.2f}"
+        except:
+            return v_str
+
+    @validator('document_type', pre=True)
+    def normalize_document_type(cls, v):
+        if v is None:
+            return None
+        return str(v).strip()
+
+    @validator('extra_fields', pre=True)
+    def normalize_extra_fields(cls, v):
+        if v is None:
+            return {}
+        if not isinstance(v, dict):
+            return {}
+        # Чистим: убираем пустые значения, None, "N/A"
+        cleaned = {}
+        for key, val in v.items():
+            if val is None:
+                continue
+            val_str = str(val).strip()
+            if val_str in ('', 'N/A', 'null', 'None', '-'):
+                continue
+            # Ключ — читаемое название
+            cleaned_key = str(key).strip().replace('_', ' ').capitalize()
+            cleaned[cleaned_key] = val_str
+        return cleaned
+
+
+class LLMAgent:
+    def __init__(self):
+        self._last_ocr_hash = None
+        self._last_result = None
+
+    def _get_ocr_hash(self, ocr_json):
+        import hashlib
+        text = ''.join([page['text'][:100] for page in ocr_json['pages']])
+        return hashlib.md5(text.encode()).hexdigest()
+
+    def interpret_multi(self, ocr_json):
+        pages_text = [page['text'] for page in ocr_json['pages']]
+        num_pages = len(pages_text)
+
+        current_hash = self._get_ocr_hash(ocr_json)
+        if self._last_ocr_hash == current_hash:
+            print(f"DEBUG: Возвращаем кэшированный результат для {num_pages} страниц")
+            return self._last_result
+
+        print(f"DEBUG interpret_multi: {num_pages} страниц")
+
+        if num_pages == 0:
+            return []
+
+        if num_pages == 1:
+            result = self._extract_from_text(pages_text[0], full_text=pages_text[0], page_num=1)
+            final_result = [result] if result and "error" not in result else []
+        else:
+            all_results = []
+            for i, page_text in enumerate(pages_text):
+                has_invoice = re.search(r'СЧЕТ\s*НА\s*ОПЛАТУ|Счет\s*№|№\s*\d+', page_text, re.IGNORECASE)
+                if has_invoice:
+                    result = self._extract_from_text(page_text, full_text=page_text, page_num=i + 1)
+                    if result and "error" not in result:
+                        all_results.append(result)
+                else:
+                    if all_results and i > 0:
+                        combined_text = pages_text[i - 1] + "\n\n" + page_text
+                        result = self._extract_from_text(combined_text, full_text=combined_text, page_num=i)
+                        if result and "error" not in result and len(all_results) > 0:
+                            all_results[-1] = result
+
+            if not all_results:
+                combined_text = "\n\n".join(pages_text)
+                result = self._extract_from_text(combined_text, full_text=combined_text, page_num=1)
+                if result and "error" not in result:
+                    all_results = [result]
+
+            for i, result in enumerate(all_results):
+                result['_page'] = i + 1
+                result['_total_pages'] = len(all_results)
+
+            final_result = all_results
+
+        self._last_ocr_hash = current_hash
+        self._last_result = final_result
+        print(f"DEBUG: Извлечено {len(final_result)} записей из {num_pages} страниц")
+        return final_result
+
+    def _extract_from_text(self, page_text, full_text=None, page_num=1):
+        if full_text is None:
+            full_text = page_text
+
+        prompt = f"""
+Ты — экстрактор данных из финансовых документов. Верни ТОЛЬКО валидный JSON. Без пояснений, без markdown.
+
+Обязательные поля (если не найдено — null):
+- date: дата документа в формате ДД.ММ.ГГГГ
+- total: итоговая сумма строкой, например "258.00"
+- currency: код валюты — ТОЛЬКО одно из: RUB, USD, EUR, BYN
+- invoice_number: номер чека, счёта, квитанции
+- company: название организации, магазина или получателя платежа
+- vat: сумма НДС строкой, если есть, иначе null
+- document_type: тип документа одним словом или коротко, например: "Кассовый чек", "Банковская квитанция", "Счёт-фактура", "Товарный чек", "Платёжное поручение"
+
+Дополнительное поле extra_fields — словарь с ЛЮБЫМИ важными данными которые ты нашёл в документе.
+Включай в extra_fields всё значимое: плательщик, получатель, банк, назначение платежа, номер карты, номер телефона, адрес, артикулы товаров, количество позиций, скидка, бонусы, кассир, терминал, номер ЕРИП, код авторизации и т.д.
+НЕ включай в extra_fields то что уже есть в основных полях (date, total, currency, invoice_number, company, vat).
+Если дополнительных данных нет — extra_fields: {{}}.
+
+Примеры:
+
+Текст: "Чек №456 от 20.01.2024. Магазин Пятёрочка. Итого: 890.00 руб. Кассир: Анна. Товаров: 5"
+Вывод: {{"date":"20.01.2024","total":"890.00","currency":"RUB","invoice_number":"456","company":"Пятёрочка","vat":null,"document_type":"Кассовый чек","extra_fields":{{"Кассир":"Анна","Количество товаров":"5"}}}}
+
+Текст: "Приорбанк. Вывоз мусора. Плательщик: Иван Иванов. Сумма 258 BYN. Получатель: Датком Столица. Номер ЕРИП: 7788888. Код авторизации: 542121"
+Вывод: {{"date":null,"total":"258.00","currency":"BYN","invoice_number":null,"company":"Датком Столица","vat":null,"document_type":"Банковская квитанция","extra_fields":{{"Плательщик":"Иван Иванов","Банк":"Приорбанк","Услуга":"Вывоз мусора","Номер ЕРИП":"7788888","Код авторизации":"542121"}}}}
+
+Теперь извлеки из следующего текста (страница {page_num}):
+
+{full_text}
+
+Вывод (только JSON):
+"""
+
+        try:
+            response = ollama.chat(
+                model=config['llm']['model'],
+                messages=[{'role': 'user', 'content': prompt}],
+                options={'temperature': config['llm']['temperature']}
+            )
+        except Exception as e:
+            logging.error(f"Ollama error on page {page_num}: {e}")
+            return None
+
+        content = response['message']['content']
+        print(f"[LLM RAW OUTPUT page {page_num}]: {content[:200]}...")
+
+        first_brace = content.find('{')
+        last_brace = content.rfind('}')
+        if first_brace == -1 or last_brace == -1:
+            logging.error(f"No JSON found on page {page_num}")
+            return None
+
+        json_str = content[first_brace:last_brace + 1]
+        json_str = clean_json_trailing_commas(json_str)
+
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError:
+            objects = []
+            brace_count = 0
+            start_idx = -1
+            for i, ch in enumerate(content):
+                if ch == '{':
+                    if brace_count == 0:
+                        start_idx = i
+                    brace_count += 1
+                elif ch == '}':
+                    brace_count -= 1
+                    if brace_count == 0 and start_idx != -1:
+                        obj_str = content[start_idx:i + 1]
+                        try:
+                            obj_str_cleaned = clean_json_trailing_commas(obj_str)
+                            objects.append(json.loads(obj_str_cleaned))
+                        except:
+                            pass
+                        start_idx = -1
+            if objects:
+                data = objects[0]
+            else:
+                logging.error(f"Could not parse JSON on page {page_num}")
+                return None
+
+        try:
+            validated = InvoiceData(**data)
+            result = validated.dict()
+
+            # Фолбэки если LLM не нашёл — ищем регулярками
+            if not result.get('invoice_number'):
+                match = re.search(r'(?:№|Номер)\s*[:]?\s*([0-9\-]+)', full_text)
+                if match:
+                    result['invoice_number'] = match.group(1)
+
+            if not result.get('company'):
+                patterns = [
+                    r'(?:Поставщик|Исполнитель|Продавец|Получатель платежа)\s*[:]?\s*([А-Яа-я0-9\s\-\"\'\,\(\)]+?)(?:\n|,|$)',
+                    r'(?:ООО|ЗАО|АО|ИП|ЧУП|ОАО|ПАО)\s+[А-Яа-я0-9\s\-\"\']+',
+                ]
+                for pat in patterns:
+                    match = re.search(pat, full_text, re.IGNORECASE)
+                    if match:
+                        company_candidate = match.group(1) if match.lastindex else match.group(0)
+                        company_candidate = company_candidate.strip().strip('"\'')
+                        if len(company_candidate) > 2:
+                            result['company'] = company_candidate
+                            break
+
+            if not result.get('vat'):
+                match = re.search(r'НДС\s*[:]?\s*([0-9\.,]+)', full_text, re.IGNORECASE)
+                if match:
+                    vat_str = match.group(1).replace(',', '.')
+                    result['vat'] = vat_str
+
+            return result
+
+        except Exception as e:
+            logging.error(f"Validation error on page {page_num}: {e}")
+            return None
+
+    def interpret(self, ocr_json):
+        result = self.interpret_multi(ocr_json)
+        if result and len(result) > 0:
+            return result[0]
+        return {"error": "No data extracted"}
+
+
+=== FILE: ./agents/validation_agent.py ===
+from datetime import datetime
+
+
+class ValidationAgent:
+    def validate(self, data: dict) -> dict:
+        errors = []
+
+        if not self.check_total(data):
+            errors.append("Сумма товаров не совпадает с итоговой суммой")
+
+        if not self.check_currency(data):
+            errors.append("Неподдерживаемая валюта")
+
+        if not self.check_date(data):
+            errors.append("Неверная дата")
+
+        if not self.check_negative_prices(data):
+            errors.append("Есть отрицательная цена")
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors
+        }
+
+    def check_total(self, data: dict) -> bool:
+        items = data.get("items", [])
+        total = data.get("total")
+
+        if total is None:
+            return False
+
+        if not items:
+            return True
+
+        try:
+            calc_sum = sum(float(item.get("price", 0)) for item in items if isinstance(item, dict))
+            return abs(calc_sum - float(total)) < 0.01
+        except Exception:
+            return False
+
+    def check_currency(self, data: dict) -> bool:
+        currency = str(data.get("currency", "")).upper().strip()
+        return currency in ["BYN", "RUB", "USD", "EUR", ""]
+
+    def check_date(self, data: dict) -> bool:
+        date_str = str(data.get("date", "")).strip()
+
+        if not date_str or date_str == "N/A" or date_str == "None" or date_str == "":
+            return True
+
+        formats = [
+            "%d.%m.%Y",
+            "%d.%m.%Y %H:%M:%S",
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%d/%m/%Y",
+            "%d/%m/%Y %H:%M:%S",
+        ]
+
+        for fmt in formats:
+            try:
+                datetime.strptime(date_str, fmt)
+                return True
+            except:
+                continue
+        return False
+
+    def check_negative_prices(self, data: dict) -> bool:
+        items = data.get("items", [])
+        if not items:
+            return True
+
+        try:
+            return all(float(item.get("price", 0)) >= 0 for item in items if isinstance(item, dict))
+        except Exception:
+            return False
+
+=== FILE: ./agents/classification_agent.py ===
+class ClassificationAgent:
+    ALLOWED_CATEGORIES = {
+        "еда",
+        "продукты",
+        "транспорт",
+        "общественный транспорт",
+        "топливо",
+        "жильё",
+        "коммунальные услуги",
+        "связь",
+        "интернет",
+        "развлечения",
+        "подписки",
+        "одежда",
+        "обувь",
+        "электроника",
+        "товары для дома",
+        "мебель",
+        "строительство",
+        "ремонт",
+        "здоровье",
+        "аптека",
+        "спорт",
+        "красота",
+        "образование",
+        "книги",
+        "офисные товары",
+        "услуги",
+        "банковские комиссии",
+        "страхование",
+        "налоги",
+        "путешествия",
+        "авиабилеты",
+        "отели",
+        "аренда авто",
+        "парковка",
+        "доставка",
+        "питомцы",
+        "дети",
+        "подарки",
+        "благотворительность",
+        "юридические услуги",
+        "консультации",
+        "фриланс",
+        "зарплата",
+        "инвестиции",
+        "криптовалюта",
+        "комиссии",
+        "штрафы",
+        "игры",
+        "ПО",
+        "прочее",
+    }
+
+    CATEGORY_ALIASES = {
+        "food": "еда",
+        "еда": "еда",
+        "restaurant": "еда",
+        "restaurants": "еда",
+        "cafe": "еда",
+        "кафе": "еда",
+        "ресторан": "еда",
+        "ресторанs": "еда",
+
+        "groceries": "продукты",
+        "продукты": "продукты",
+        "supermarket": "продукты",
+        "супермаркет": "продукты",
+
+        "transport": "транспорт",
+        "транспорт": "транспорт",
+        "taxi": "транспорт",
+        "такси": "транспорт",
+
+        "public_transport": "общественный транспорт",
+        "public transport": "общественный транспорт",
+        "общественный транспорт": "общественный транспорт",
+        "metro": "общественный транспорт",
+        "bus": "общественный транспорт",
+        "train": "общественный транспорт",
+
+        "fuel": "топливо",
+        "топливо": "топливо",
+        "бензин": "топливо",
+        "diesel": "топливо",
+
+        "accommodation": "жильё",
+        "housing": "жильё",
+        "жильё": "жильё",
+        "жилье": "жильё",
+        "аренда": "жильё",
+
+        "utilities": "коммунальные услуги",
+        "коммунальные услуги": "коммунальные услуги",
+
+        "mobile": "связь",
+        "связь": "связь",
+        "mobile связи": "связь",
+
+        "internet": "интернет",
+        "интернет": "интернет",
+
+        "entertainment": "развлечения",
+        "развлечения": "развлечения",
+
+        "subscriptions": "подписки",
+        "подписки": "подписки",
+
+        "shopping": "прочее",
+        "purchases": "прочее",
+        "покупки": "прочее",
+
+        "clothing": "одежда",
+        "одежда": "одежда",
+
+        "shoes": "обувь",
+        "обувь": "обувь",
+
+        "electronics": "электроника",
+        "электроника": "электроника",
+
+        "home goods": "товары для дома",
+        "товары для дома": "товары для дома",
+
+        "furniture": "мебель",
+        "мебель": "мебель",
+
+        "construction": "строительство",
+        "строительство": "строительство",
+
+        "repair": "ремонт",
+        "ремонт": "ремонт",
+
+        "health": "здоровье",
+        "здоровье": "здоровье",
+
+        "pharmacy": "аптека",
+        "аптека": "аптека",
+
+        "fitness": "спорт",
+        "спорт": "спорт",
+
+        "beauty": "красота",
+        "красота": "красота",
+
+        "education": "образование",
+        "образование": "образование",
+
+        "books": "книги",
+        "книги": "книги",
+
+        "office": "офисные товары",
+        "офисные товары": "офисные товары",
+
+        "services": "услуги",
+        "услуги": "услуги",
+
+        "banking": "банковские комиссии",
+        "банковские комиссии": "банковские комиссии",
+
+        "insurance": "страхование",
+        "страхование": "страхование",
+
+        "taxes": "налоги",
+        "налоги": "налоги",
+
+        "travel": "путешествия",
+        "путешествия": "путешествия",
+
+        "flights": "авиабилеты",
+        "авиабилеты": "авиабилеты",
+
+        "hotels": "отели",
+        "отели": "отели",
+
+        "car_rental": "аренда авто",
+        "аренда авто": "аренда авто",
+
+        "parking": "парковка",
+        "парковка": "парковка",
+
+        "delivery": "доставка",
+        "доставка": "доставка",
+
+        "pets": "питомцы",
+        "питомцы": "питомцы",
+
+        "kids": "дети",
+        "дети": "дети",
+
+        "gifts": "подарки",
+        "подарки": "подарки",
+
+        "charity": "благотворительность",
+        "благотворительность": "благотворительность",
+
+        "legal": "юридические услуги",
+        "юридические услуги": "юридические услуги",
+
+        "consulting": "консультации",
+        "консультации": "консультации",
+
+        "freelance": "фриланс",
+        "фриланс": "фриланс",
+
+        "salary": "зарплата",
+        "зарплата": "зарплата",
+
+        "investment": "инвестиции",
+        "инвестиции": "инвестиции",
+
+        "crypto": "криптовалюта",
+        "криптовалюта": "криптовалюта",
+
+        "fees": "комиссии",
+        "комиссии": "комиссии",
+
+        "fines": "штрафы",
+        "штрафы": "штрафы",
+
+        "gaming": "игры",
+        "игры": "игры",
+
+        "software": "ПО",
+        "по": "ПО",
+        "ПО": "ПО",
+
+        "other": "прочее",
+        "прочее": "прочее",
+    }
+
+    def __init__(self, llm):
+        self.llm = llm
+
+    def classify(self, data: dict) -> dict:
+        response = self.llm.generate(self._build_prompt(data))
+        category = self._extract_category(response)
+        return {"category": category}
+
+    def _build_prompt(self, data: dict) -> str:
+        merchant = str(data.get("merchant", "")).strip() or "не указан"
+
+        items = data.get("items", [])
+        item_names = []
+
+        for item in items:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                if name:
+                    item_names.append(name)
+
+        items_text = ", ".join(item_names) if item_names else "не указаны"
+
+        return f"""
+Ты классифицируешь расход по чеку.
+
+Основной признак для классификации — товары или услуги.
+Название магазина используй только как дополнительную подсказку.
+Если магазин и товар дают разный смысл, ориентируйся прежде всего на товар.
+
+Данные:
+Магазин: {merchant}
+Товары/услуги: {items_text}
+
+Категории:
+еда — готовая еда, кафе, рестораны
+продукты — супермаркеты, бакалея, продукты
+транспорт — такси, поездки, каршеринг
+общественный транспорт — автобус, метро, поезд, трамвай
+топливо — бензин, дизель, газ
+жильё — аренда, проживание, жильё
+коммунальные услуги — вода, свет, отопление, газ, ЖКХ
+связь — мобильная связь
+интернет — домашний интернет, провайдеры
+развлечения — кино, игры, досуг
+подписки — подписочные сервисы
+одежда — одежда и аксессуары
+обувь — обувь
+электроника — телефоны, ноутбуки, гаджеты
+товары для дома — бытовые товары
+мебель — мебель
+строительство — инструменты, молоток, гвозди, стройматериалы
+ремонт — услуги ремонта
+здоровье — медицинские услуги
+аптека — лекарства, аптечные товары
+спорт — спортзал, инвентарь
+красота — косметика, салоны
+образование — курсы, обучение
+книги — книги, учебники
+офисные товары — канцтовары
+услуги — сервисные услуги
+банковские комиссии — комиссии банка
+страхование — страховки
+налоги — налоги и сборы
+путешествия — поездки, туризм
+авиабилеты — билеты на самолёт
+отели — гостиницы
+аренда авто — прокат автомобиля
+парковка — парковка
+доставка — курьерская доставка
+питомцы — товары и услуги для животных
+дети — товары и услуги для детей
+подарки — подарки и сувениры
+благотворительность — пожертвования
+юридические услуги — юристы, нотариусы
+консультации — консультационные услуги
+фриланс — оплата фриланс-работ
+зарплата — выплаты зарплаты
+инвестиции — инвестиционные операции
+криптовалюта — операции с криптовалютой
+комиссии — прочие комиссии
+штрафы — штрафы и пени
+игры — игровые товары и сервисы
+ПО — программное обеспечение, лицензии
+прочее — если ничего не подходит
+
+Верни ТОЛЬКО JSON без лишнего текста:
+{{"category": "одна_из_категорий"}}
+"""
+
+    def _extract_category(self, response) -> str:
+        raw_category = ""
+
+        if isinstance(response, dict):
+            raw_category = str(response.get("category", "")).strip()
+        elif isinstance(response, str):
+            raw_category = response.strip()
+        else:
+            raw_category = str(response).strip()
+
+        return self._normalize_category(raw_category)
+
+    def _normalize_category(self, value: str) -> str:
+        if not value:
+            return "прочее"
+
+        key = value.lower().strip().replace("ё", "е")
+        key = key.replace("_", " ").replace("-", " ")
+
+        if key in self.CATEGORY_ALIASES:
+            return self.CATEGORY_ALIASES[key]
+
+        if value in self.ALLOWED_CATEGORIES:
+            return value
+
+        return "прочее"
+
+=== FILE: ./index.html ===
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ДокАнализ — Обработка финансовых документов</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600&display=swap');
+
+  :root {
+    --bg:      #0f1117;
+    --surface: #171b26;
+    --card:    #1e2333;
+    --border:  #2a3045;
+    --accent:  #4f8ef7;
+    --accent2: #7c5cfc;
+    --green:   #2dd4a0;
+    --red:     #f76f6f;
+    --amber:   #f5a623;
+    --text:    #e8ecf4;
+    --muted:   #7a85a3;
+    --mono:    'IBM Plex Mono', monospace;
+    --sans:    'Inter', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 14px;
+    min-height: 100vh; display: flex; flex-direction: column;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 28px; border-bottom: 1px solid var(--border);
+    background: var(--surface); position: sticky; top: 0; z-index: 100;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 17px; font-weight: 600; }
+  .logo-icon { width: 32px; height: 32px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 16px; }
+  .logo span { color: var(--muted); font-weight: 400; }
+  .tabs { display: flex; gap: 4px; background: var(--bg); border-radius: 8px; padding: 4px; }
+  .tab-btn { padding: 6px 18px; border: none; background: transparent; color: var(--muted); font-family: var(--sans); font-size: 13px; font-weight: 500; border-radius: 6px; cursor: pointer; transition: all .18s; }
+  .tab-btn.active { background: var(--card); color: var(--text); }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+  .status-chip { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 500; }
+  .status-chip.idle    { background: rgba(122,133,163,.12); color: var(--muted); }
+  .status-chip.processing { background: rgba(245,166,35,.12); color: var(--amber); }
+  .status-chip.done    { background: rgba(45,212,160,.12);  color: var(--green); }
+  .status-chip.error   { background: rgba(247,111,111,.12); color: var(--red); }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .status-chip.processing .status-dot { animation: pulse 1s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* ── Layout ── */
+  main { flex: 1; display: flex; flex-direction: column; }
+  .tab-panel { display: none; flex: 1; }
+  .tab-panel.active { display: flex; flex-direction: column; flex: 1; }
+
+  .workspace {
+    display: grid;
+    grid-template-columns: 300px 1fr 1fr;
+    grid-template-rows: 1fr auto;
+    flex: 1; min-height: 0; height: calc(100vh - 57px);
+  }
+
+  .panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  .panel:last-child { border-right: none; }
+  .panel-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .panel-title { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); }
+  .panel-badge { font-family: var(--mono); font-size: 11px; background: var(--card); border: 1px solid var(--border); padding: 2px 8px; border-radius: 4px; color: var(--accent); }
+
+  /* ── Controls ── */
+  .controls-panel { background: var(--surface); }
+  .controls-body { padding: 14px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; flex: 1; }
+
+  .upload-zone { border: 2px dashed var(--border); border-radius: 10px; padding: 20px 16px; text-align: center; cursor: pointer; transition: all .2s; background: var(--card); position: relative; }
+  .upload-zone:hover, .upload-zone.drag-over { border-color: var(--accent); background: rgba(79,142,247,.06); }
+  .upload-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .upload-icon { font-size: 26px; margin-bottom: 6px; }
+  .upload-text { color: var(--text); font-size: 13px; font-weight: 500; }
+  .upload-sub { color: var(--muted); font-size: 11px; margin-top: 3px; }
+
+  .file-list { display: flex; flex-direction: column; gap: 5px; }
+  .file-item { display: flex; align-items: center; gap: 8px; padding: 7px 9px; background: var(--card); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; transition: border-color .15s; }
+  .file-item:hover { border-color: var(--accent); }
+  .file-item.active { border-color: var(--accent); background: rgba(79,142,247,.08); }
+  .file-thumb { width: 30px; height: 30px; border-radius: 4px; background: var(--border); overflow: hidden; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 13px; }
+  .file-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .file-info { flex: 1; min-width: 0; }
+  .file-name { font-size: 11px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-meta { font-size: 10px; color: var(--muted); margin-top: 1px; }
+  .file-remove { width: 18px; height: 18px; border-radius: 3px; background: transparent; border: none; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0; transition: all .15s; }
+  .file-remove:hover { background: rgba(247,111,111,.15); color: var(--red); }
+
+  .btn { display: flex; align-items: center; justify-content: center; gap: 7px; padding: 9px 14px; border-radius: 8px; border: none; font-family: var(--sans); font-size: 13px; font-weight: 600; cursor: pointer; transition: all .18s; width: 100%; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-primary { background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; }
+  .btn-primary:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
+  .btn-secondary { background: var(--card); border: 1px solid var(--border); color: var(--text); }
+  .btn-secondary:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .btn-danger { background: rgba(247,111,111,.1); border: 1px solid rgba(247,111,111,.3); color: var(--red); }
+  .btn-danger:hover:not(:disabled) { background: rgba(247,111,111,.18); }
+  .separator { height: 1px; background: var(--border); margin: 2px 0; }
+
+  .tech-block { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .tech-block-title { padding: 7px 12px; font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .tech-rows { padding: 6px 0; }
+  .tech-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 12px; font-size: 11px; }
+  .tech-row .k { color: var(--muted); }
+  .tech-row .v { color: var(--text); font-family: var(--mono); font-weight: 500; }
+  .tech-row .v.green { color: var(--green); }
+  .tech-row .v.blue  { color: var(--accent); }
+
+  /* ── Preview panel ── */
+  .preview-panel { background: var(--bg); }
+  .preview-body { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; position: relative; padding: 12px; }
+  .preview-empty { text-align: center; color: var(--muted); }
+  .preview-empty-icon { font-size: 44px; margin-bottom: 10px; opacity: .4; }
+
+  /* Image + canvas overlay container */
+  .preview-img-wrap { display: none; position: relative; max-width: 100%; max-height: 100%; }
+  .preview-img-wrap.visible { display: block; }
+  .preview-img { display: block; max-width: 100%; max-height: calc(100vh - 220px); object-fit: contain; border-radius: 6px; border: 1px solid var(--border); transition: transform .3s ease; }
+  /* Canvas sits exactly on top of the image */
+  #highlightCanvas {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none; /* mouse passes through to image */
+    border-radius: 6px;
+  }
+  /* Invisible hit-area divs for OCR blocks */
+  #ocrHitLayer {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: all;
+  }
+  .ocr-hit {
+    position: absolute;
+    cursor: crosshair;
+  }
+  .ocr-hit:hover ~ #highlightCanvas { /* handled via JS */ }
+
+  .preview-nav { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); flex-shrink: 0; background: var(--surface); justify-content: space-between; }
+  .nav-arrows { display: flex; align-items: center; gap: 5px; }
+  .nav-btn { width: 28px; height: 28px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 13px; transition: all .15s; }
+  .nav-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .nav-btn:disabled { opacity: .35; cursor: not-allowed; }
+  .nav-counter { font-family: var(--mono); font-size: 11px; color: var(--muted); min-width: 55px; text-align: center; }
+  .nav-label { font-size: 11px; color: var(--muted); max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Results panel ── */
+  .results-panel { background: var(--bg); }
+  .results-body { flex: 1; overflow-y: auto; padding: 14px; }
+  .result-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--muted); text-align: center; }
+  .result-empty-icon { font-size: 38px; margin-bottom: 10px; opacity: .35; }
+
+  .result-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 10px; }
+  .result-card-header { padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); background: rgba(255,255,255,.02); }
+  .result-card-title { font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); }
+  .result-fields { padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
+
+  /* Each field row — hoverable */
+  .result-field {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 5px 8px; border-radius: 6px; border: 1px solid transparent;
+    cursor: default; transition: background .15s, border-color .15s;
+    position: relative;
+  }
+  .result-field:hover {
+    background: rgba(79,142,247,.07);
+    border-color: rgba(79,142,247,.25);
+  }
+  /* Active highlight (triggered from canvas hover) */
+  .result-field.hl-active {
+    background: rgba(79,142,247,.15) !important;
+    border-color: var(--accent) !important;
+  }
+  .result-field-key { font-size: 11px; color: var(--muted); min-width: 100px; flex-shrink: 0; }
+  .result-field-val { font-family: var(--mono); font-size: 13px; color: var(--text); font-weight: 500; }
+  .result-field-val.big { font-size: 17px; color: var(--accent); }
+  .result-field-val.na { color: var(--muted); font-size: 11px; font-family: var(--sans); }
+
+  /* Tooltip shown on field hover */
+  .field-tooltip {
+    display: none;
+    position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+    background: var(--accent); color: #fff;
+    font-size: 10px; font-family: var(--mono);
+    padding: 2px 7px; border-radius: 4px;
+    white-space: nowrap; pointer-events: none;
+    z-index: 5;
+  }
+  .result-field:hover .field-tooltip { display: block; }
+
+  .validation-block { margin: 0 14px 14px; padding: 9px 12px; border-radius: 8px; border: 1px solid; }
+  .validation-block.valid   { border-color: rgba(45,212,160,.3); background: rgba(45,212,160,.06); }
+  .validation-block.invalid { border-color: rgba(247,111,111,.3); background: rgba(247,111,111,.06); }
+  .validation-status { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .validation-status.valid   { color: var(--green); }
+  .validation-status.invalid { color: var(--red); }
+  .validation-errors { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+  .validation-err-item { font-size: 11px; color: var(--red); padding-left: 12px; position: relative; }
+  .validation-err-item::before { content: '•'; position: absolute; left: 2px; }
+
+  .category-tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 20px; font-size: 10px; font-weight: 600; background: rgba(79,142,247,.12); color: var(--accent); border: 1px solid rgba(79,142,247,.2); text-transform: uppercase; letter-spacing: .5px; }
+
+  /* ── Log ── */
+  .log-panel { grid-column: 1 / -1; border-top: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; max-height: 150px; flex-shrink: 0; }
+  .log-header { display: flex; align-items: center; justify-content: space-between; padding: 7px 16px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
+  .log-title { font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+  .log-toggle { font-size: 10px; color: var(--muted); transition: transform .2s; }
+  .log-toggle.collapsed { transform: rotate(-90deg); }
+  .log-body { flex: 1; overflow-y: auto; padding: 6px 16px; font-family: var(--mono); font-size: 11px; color: var(--muted); line-height: 1.7; }
+  .log-body.hidden { display: none; }
+  .log-line { display: flex; gap: 8px; }
+  .log-line .ts { color: var(--border); flex-shrink: 0; }
+  .log-line.info .msg    { color: var(--muted); }
+  .log-line.success .msg { color: var(--green); }
+  .log-line.error .msg   { color: var(--red); }
+  .log-line.step .msg    { color: var(--accent); }
+
+  .actions-row { display: flex; gap: 8px; padding: 8px 14px; border-top: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+  .actions-row .btn { width: auto; flex: 1; padding: 7px 10px; font-size: 12px; }
+
+  /* ── History ── */
+  #tab-history { padding: 20px 24px; flex: 1; overflow-y: auto; }
+  .history-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .search-input { flex: 1; padding: 7px 12px; background: var(--card); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font-family: var(--sans); font-size: 13px; outline: none; transition: border-color .15s; }
+  .search-input:focus { border-color: var(--accent); }
+  .search-input::placeholder { color: var(--muted); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { padding: 9px 13px; text-align: left; font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 1; }
+  tbody tr { border-bottom: 1px solid rgba(42,48,69,.6); transition: background .12s; cursor: pointer; }
+  tbody tr:hover { background: var(--card); }
+  tbody tr.selected { background: rgba(79,142,247,.08); }
+  tbody td { padding: 9px 13px; color: var(--text); }
+  tbody td.id { font-family: var(--mono); color: var(--muted); }
+  tbody td.filename { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tbody td.date { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  tbody td.amount { font-family: var(--mono); font-weight: 600; color: var(--accent); }
+
+  /* ── Modal ── */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 200; align-items: center; justify-content: center; padding: 20px; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; width: 100%; max-width: 700px; max-height: 80vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,.5); }
+  .modal-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+  .modal-title { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--text); }
+  .modal-close { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; width: 28px; height: 28px; border-radius: 5px; transition: all .15s; }
+  .modal-close:hover { background: var(--card); color: var(--text); }
+  .modal-body { flex: 1; overflow-y: auto; padding: 18px; font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+  .modal-footer { padding: 10px 18px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-footer .btn { width: auto; }
+
+  /* ── Processing overlay ── */
+  .processing-overlay { display: none; position: absolute; inset: 0; background: rgba(15,17,23,.85); z-index: 10; align-items: center; justify-content: center; flex-direction: column; gap: 14px; }
+  .processing-overlay.active { display: flex; }
+  .spinner { width: 38px; height: 38px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .processing-text { font-family: var(--mono); font-size: 13px; color: var(--accent); }
+  .processing-step { font-size: 11px; color: var(--muted); }
+
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+  /* ── Toast ── */
+  .toast-container { position: fixed; bottom: 20px; right: 20px; z-index: 300; display: flex; flex-direction: column; gap: 8px; }
+  .toast { padding: 9px 14px; border-radius: 8px; font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 8px; box-shadow: 0 4px 16px rgba(0,0,0,.3); animation: slideIn .2s ease; max-width: 300px; }
+  @keyframes slideIn { from{opacity:0;transform:translateX(20px)} to{opacity:1;transform:none} }
+  .toast.success { background: rgba(45,212,160,.15); border: 1px solid rgba(45,212,160,.3); color: var(--green); }
+  .toast.error   { background: rgba(247,111,111,.15); border: 1px solid rgba(247,111,111,.3); color: var(--red); }
+  .toast.info    { background: rgba(79,142,247,.15);  border: 1px solid rgba(79,142,247,.3);  color: var(--accent); }
+
+  /* ── Highlight legend ── */
+  .hl-legend {
+    display: none;
+    position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
+    background: rgba(15,17,23,.85); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px;
+    font-size: 10px; font-family: var(--mono); color: var(--muted);
+    white-space: nowrap; pointer-events: none; z-index: 5;
+  }
+  .hl-legend.visible { display: block; }
+  .hl-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">📄</div>
+    ДокАнализ <span>/ финансовые документы</span>
+  </div>
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('process',this)">Обработка</button>
+    <button class="tab-btn" onclick="switchTab('history',this)">История</button>
+  </div>
+  <div id="globalStatus" class="status-chip idle">
+    <div class="status-dot"></div><span>Готов</span>
+  </div>
+</header>
+
+<main>
+  <!-- ══ PROCESS TAB ══ -->
+  <div class="tab-panel active" id="tab-process">
+    <div class="workspace">
+
+      <!-- Left: Controls -->
+      <div class="panel controls-panel" style="grid-row:1">
+        <div class="panel-header">
+          <span class="panel-title">Управление</span>
+          <span class="panel-badge" id="fileCountBadge">0 файлов</span>
+        </div>
+        <div class="controls-body">
+          <div class="upload-zone" id="uploadZone">
+            <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.pdf" multiple>
+            <div class="upload-icon">📂</div>
+            <div class="upload-text">Перетащите файлы сюда</div>
+            <div class="upload-sub">PNG, JPG, PDF · несколько файлов</div>
+          </div>
+
+          <div class="file-list" id="fileList"></div>
+          <div class="separator"></div>
+
+          <button class="btn btn-secondary" id="btnRotate" onclick="rotatePreview()" disabled>
+            ⟳ Повернуть предпросмотр
+          </button>
+          <div class="separator"></div>
+
+          <div class="tech-block">
+            <div class="tech-block-title">Конфигурация системы</div>
+            <div class="tech-rows">
+              <div class="tech-row"><span class="k">OCR движок</span><span class="v blue">Tesseract</span></div>
+              <div class="tech-row"><span class="k">Язык OCR</span><span class="v">rus + eng</span></div>
+              <div class="tech-row"><span class="k">LLM модель</span><span class="v blue">Mistral (Ollama)</span></div>
+              <div class="tech-row"><span class="k">Перевод</span><span class="v green">Включён</span></div>
+              <div class="tech-row"><span class="k">Валидация</span><span class="v green">Включена</span></div>
+              <div class="tech-row"><span class="k">База данных</span><span class="v">SQLite</span></div>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="btnProcess" onclick="startProcessing()" disabled>▶ Запустить анализ</button>
+          <button class="btn btn-secondary" id="btnClear" onclick="clearAll()" disabled>Очистить всё</button>
+        </div>
+      </div>
+
+      <!-- Middle: Preview -->
+      <div class="panel preview-panel" style="grid-row:1; position:relative;">
+        <div class="panel-header">
+          <span class="panel-title">Предпросмотр</span>
+          <span class="panel-badge" id="previewCounter">—</span>
+        </div>
+        <div class="preview-body" id="previewBody">
+          <div class="preview-empty" id="previewEmpty">
+            <div class="preview-empty-icon">🖼</div>
+            <div style="font-size:13px">Документ не выбран</div>
+            <div style="font-size:11px;margin-top:4px;opacity:.6">Загрузите файл для предпросмотра</div>
+          </div>
+
+          <!-- Image + highlight canvas + hit layer -->
+          <div class="preview-img-wrap" id="previewImgWrap">
+            <img id="previewImg" class="preview-img" src="" alt="Предпросмотр"
+                 onload="onPreviewImageLoad()">
+            <canvas id="highlightCanvas"></canvas>
+            <div id="ocrHitLayer"></div>
+          </div>
+
+          <!-- Highlight legend -->
+          <div class="hl-legend" id="hlLegend">
+            <span class="hl-swatch" style="background:rgba(79,142,247,.5)"></span>Найдено в документе
+          </div>
+
+          <div class="processing-overlay" id="processingOverlay">
+            <div class="spinner"></div>
+            <div class="processing-text">Обработка...</div>
+            <div class="processing-step" id="processingStep">Инициализация</div>
+          </div>
+        </div>
+        <div class="preview-nav">
+          <div class="nav-arrows">
+            <button class="nav-btn" id="prevFileBtn" onclick="navigateFile(-1)" disabled>◀</button>
+            <span class="nav-counter" id="previewFileCounter">—</span>
+            <button class="nav-btn" id="nextFileBtn" onclick="navigateFile(1)" disabled>▶</button>
+          </div>
+          <span class="nav-label" id="previewFileName">Нет файла</span>
+          <div class="nav-arrows">
+            <button class="nav-btn" id="prevPageBtn" onclick="navigatePage(-1)" disabled>‹</button>
+            <span class="nav-counter" id="previewPageCounter">—</span>
+            <button class="nav-btn" id="nextPageBtn" onclick="navigatePage(1)" disabled>›</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Results -->
+      <div class="panel results-panel" style="grid-row:1;">
+        <div class="panel-header">
+          <span class="panel-title">Результат анализа</span>
+          <span class="panel-badge" id="resultCounter">—</span>
+        </div>
+        <div class="results-body" id="resultsBody">
+          <div class="result-empty" id="resultEmpty">
+            <div class="result-empty-icon">📊</div>
+            <div style="font-size:13px">Запустите анализ</div>
+            <div style="font-size:11px;margin-top:4px">Результаты появятся здесь</div>
+          </div>
+          <div id="resultContent" style="display:none"></div>
+        </div>
+        <div class="preview-nav" id="resultNav" style="display:none">
+          <div class="nav-arrows">
+            <button class="nav-btn" id="prevResFileBtn" onclick="navigateResultFile(-1)" disabled>◀</button>
+            <span class="nav-counter" id="resultFileCounter">—</span>
+            <button class="nav-btn" id="nextResFileBtn" onclick="navigateResultFile(1)" disabled>▶</button>
+          </div>
+          <span class="nav-label" id="resultFileName">—</span>
+          <div class="nav-arrows">
+            <button class="nav-btn" id="prevResPageBtn" onclick="navigateResultPage(-1)" disabled>‹</button>
+            <span class="nav-counter" id="resultPageCounter">—</span>
+            <button class="nav-btn" id="nextResPageBtn" onclick="navigateResultPage(1)" disabled>›</button>
+          </div>
+        </div>
+        <div class="actions-row" id="actionsRow" style="display:none">
+          <button class="btn btn-secondary" onclick="exportJSON()">⬇ JSON</button>
+          <button class="btn btn-secondary" onclick="copyResult()">⎘ Скопировать</button>
+        </div>
+      </div>
+
+      <!-- Log -->
+      <div class="log-panel">
+        <div class="log-header" onclick="toggleLog()">
+          <span class="log-title">Лог обработки <span id="logCount" style="color:var(--border);font-weight:400">0 записей</span></span>
+          <span class="log-toggle" id="logToggle">▼</span>
+        </div>
+        <div class="log-body" id="logBody">
+          <div class="log-line info"><span class="ts">—</span><span class="msg">Ожидание файлов...</span></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ══ HISTORY TAB ══ -->
+  <div class="tab-panel" id="tab-history">
+    <div class="history-toolbar">
+      <input class="search-input" type="text" id="historySearch" placeholder="Поиск по файлу, категории, сумме..." oninput="filterHistory()">
+      <button class="btn btn-secondary" style="width:auto;padding:7px 12px;font-size:12px" onclick="loadHistory()">↺ Обновить</button>
+      <button class="btn btn-danger"    style="width:auto;padding:7px 12px;font-size:12px" onclick="deleteSelected()">✕ Удалить</button>
+    </div>
+    <table>
+      <thead><tr><th>ID</th><th>Файл</th><th>Дата обработки</th><th>Сумма</th><th>Категория</th></tr></thead>
+      <tbody id="historyBody">
+        <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">История загрузится при открытии вкладки</td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modalOverlay" onclick="closeModalOutside(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle">Просмотр документа</span>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()" style="width:auto;padding:7px 18px">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script>
+// ════════════════════════════════════════════════
+// STATE
+// ════════════════════════════════════════════════
+const state = {
+  files: [],              // { file, name, pages:[{blob,rotation}], status, result }
+  currentFileIdx: 0,
+  currentPageIdx: 0,
+  results: [],            // { filename, parsed_list, logs, doc_id, pages_blocks, field_mappings }
+  currentResFileIdx: 0,
+  currentResPageIdx: 0,
+  processing: false,
+  logCollapsed: false,
+  history: [],
+
+  // Highlight state
+  // activeField: null | { fieldName, blocks }  — field hovered from result panel
+  // activeBlock: null | { fieldName }           — OCR block hovered from preview
+  activeField: null,
+  activeBlock: null,
+
+  // OCR image scale info (needed to map OCR pixel coords → displayed image coords)
+  // Filled by onPreviewImageLoad()
+  imgNaturalW: 0,
+  imgNaturalH: 0,
+  imgDisplayW: 0,
+  imgDisplayH: 0,
+};
+
+// ════════════════════════════════════════════════
+// TABS
+// ════════════════════════════════════════════════
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  if (btn) btn.classList.add('active');
+  if (name === 'history') loadHistory();
+}
+
+// ════════════════════════════════════════════════
+// FILE HANDLING
+// ════════════════════════════════════════════════
+const fileInput  = document.getElementById('fileInput');
+const uploadZone = document.getElementById('uploadZone');
+
+fileInput.addEventListener('change', e => addFiles(e.target.files));
+uploadZone.addEventListener('dragover',  e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); uploadZone.classList.remove('drag-over'); addFiles(e.dataTransfer.files);
+});
+
+async function addFiles(fileList) {
+  for (const file of fileList) {
+    if (!file.type.match(/image\/(png|jpeg)|application\/pdf/)) {
+      showToast('Неподдерживаемый формат: ' + file.name, 'error'); continue;
+    }
+    const pages = await extractPages(file);
+    state.files.push({ file, name: file.name, pages, status: 'idle', result: null });
+  }
+  if (state.files.length > 0) { state.currentFileIdx = state.files.length - 1; state.currentPageIdx = 0; }
+  renderFileList(); showPreview(); updateButtons(); updateNavButtons();
+}
+
+async function extractPages(file) {
+  if (file.type !== 'application/pdf') return [{ blob: URL.createObjectURL(file), rotation: 0 }];
+  try { return await renderPDFPages(file); } catch(e) { return [{ blob: URL.createObjectURL(file), rotation: 0 }]; }
+}
+
+async function renderPDFPages(file) {
+  if (!window.pdfjsLib) {
+    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js');
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+  const ab = await file.arrayBuffer();
+  const pdf = await window.pdfjsLib.getDocument({ data: ab }).promise;
+  const pages = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const vp = page.getViewport({ scale: 1.5 });
+    const canvas = document.createElement('canvas');
+    canvas.width = vp.width; canvas.height = vp.height;
+    await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+    pages.push({ blob: canvas.toDataURL('image/png'), rotation: 0 });
+  }
+  return pages;
+}
+
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = rej;
+    document.head.appendChild(s);
+  });
+}
+
+function renderFileList() {
+  const list = document.getElementById('fileList');
+  list.innerHTML = '';
+  state.files.forEach((f, i) => {
+    const div = document.createElement('div');
+    div.className = 'file-item' + (i === state.currentFileIdx ? ' active' : '');
+    div.onclick = () => selectFile(i);
+    const isPDF = f.file.type === 'application/pdf';
+    const firstBlob = f.pages[0] && f.pages[0].blob;
+    const thumbHTML = (!isPDF && firstBlob) ? `<img src="${firstBlob}" alt="">` : '📄';
+    const statusColor = {idle:'var(--muted)',processing:'var(--amber)',done:'var(--green)',error:'var(--red)'}[f.status];
+    const statusIcon  = {idle:'○',processing:'⟳',done:'✓',error:'✗'}[f.status];
+    div.innerHTML = `
+      <div class="file-thumb">${thumbHTML}</div>
+      <div class="file-info">
+        <div class="file-name" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
+        <div class="file-meta">${f.pages.length} стр. &nbsp;<span style="color:${statusColor}">${statusIcon}</span></div>
+      </div>
+      <button class="file-remove" onclick="removeFile(event,${i})">×</button>`;
+    list.appendChild(div);
+  });
+  document.getElementById('fileCountBadge').textContent = state.files.length + ' файлов';
+}
+
+function selectFile(idx) {
+  state.currentFileIdx = idx; state.currentPageIdx = 0;
+  renderFileList(); showPreview(); updateNavButtons();
+  clearHighlights();
+}
+
+function removeFile(e, idx) {
+  e.stopPropagation(); state.files.splice(idx, 1);
+  if (state.currentFileIdx >= state.files.length) state.currentFileIdx = Math.max(0, state.files.length - 1);
+  state.currentPageIdx = 0;
+  renderFileList(); showPreview(); updateButtons(); updateNavButtons(); clearHighlights();
+}
+
+// ════════════════════════════════════════════════
+// PREVIEW
+// ════════════════════════════════════════════════
+function showPreview() {
+  const empty = document.getElementById('previewEmpty');
+  const wrap  = document.getElementById('previewImgWrap');
+  const img   = document.getElementById('previewImg');
+
+  if (state.files.length === 0) {
+    empty.style.display = ''; wrap.classList.remove('visible');
+    document.getElementById('previewCounter').textContent = '—';
+    document.getElementById('previewFileCounter').textContent = '—';
+    document.getElementById('previewPageCounter').textContent = '—';
+    document.getElementById('previewFileName').textContent = 'Нет файла';
+    return;
+  }
+  const f = state.files[state.currentFileIdx];
+  if (!f) return;
+  const page = f.pages[state.currentPageIdx];
+  if (!page) return;
+
+  empty.style.display = 'none'; wrap.classList.add('visible');
+  img.style.transform = `rotate(${page.rotation || 0}deg)`;
+  img.src = page.blob;
+
+  const fi = state.currentFileIdx + 1, ft = state.files.length;
+  const pi = state.currentPageIdx + 1,  pt = f.pages.length;
+  document.getElementById('previewCounter').textContent = `${fi}/${ft} · стр.${pi}/${pt}`;
+  document.getElementById('previewFileCounter').textContent = `${fi} / ${ft}`;
+  document.getElementById('previewPageCounter').textContent = `стр.${pi}/${pt}`;
+  document.getElementById('previewFileName').textContent = f.name;
+
+  clearHighlights();
+  // Rebuild OCR hit zones if we have results for this file/page
+  rebuildOcrHitLayer();
+}
+
+// Called when the preview <img> finishes loading (natural size becomes known)
+function onPreviewImageLoad() {
+  const img = document.getElementById('previewImg');
+  state.imgNaturalW = img.naturalWidth;
+  state.imgNaturalH = img.naturalHeight;
+  state.imgDisplayW = img.offsetWidth;
+  state.imgDisplayH = img.offsetHeight;
+  // Resize canvas to match image display size
+  const canvas = document.getElementById('highlightCanvas');
+  canvas.width  = img.offsetWidth;
+  canvas.height = img.offsetHeight;
+  rebuildOcrHitLayer();
+}
+
+// Update canvas size on window resize
+window.addEventListener('resize', () => {
+  const img = document.getElementById('previewImg');
+  if (!img.src || img.src === window.location.href) return;
+  state.imgDisplayW = img.offsetWidth;
+  state.imgDisplayH = img.offsetHeight;
+  const canvas = document.getElementById('highlightCanvas');
+  canvas.width  = img.offsetWidth;
+  canvas.height = img.offsetHeight;
+  redrawCanvas();
+});
+
+function navigateFile(dir) {
+  const newIdx = state.currentFileIdx + dir;
+  if (newIdx < 0 || newIdx >= state.files.length) return;
+  state.currentFileIdx = newIdx; state.currentPageIdx = 0;
+  renderFileList(); showPreview(); updateNavButtons(); clearHighlights();
+  if (state.results.length > 0) {
+    state.currentResFileIdx = Math.min(newIdx, state.results.length - 1);
+    state.currentResPageIdx = 0; renderResult();
+  }
+}
+
+function navigatePage(dir) {
+  if (state.files.length === 0) return;
+  const f = state.files[state.currentFileIdx];
+  const newIdx = state.currentPageIdx + dir;
+  if (newIdx < 0 || newIdx >= f.pages.length) return;
+  state.currentPageIdx = newIdx; showPreview(); updateNavButtons(); clearHighlights();
+  const res = state.results[state.currentResFileIdx];
+  if (res && newIdx < res.parsed_list.length) { state.currentResPageIdx = newIdx; renderResult(); }
+}
+
+function rotatePreview() {
+  if (state.files.length === 0) return;
+  const page = state.files[state.currentFileIdx].pages[state.currentPageIdx];
+  if (!page) return;
+  page.rotation = ((page.rotation || 0) + 90) % 360;
+  showPreview();
+}
+
+function updateNavButtons() {
+  const f = state.files.length > 0 ? state.files[state.currentFileIdx] : null;
+  document.getElementById('prevFileBtn').disabled = state.currentFileIdx <= 0;
+  document.getElementById('nextFileBtn').disabled = state.currentFileIdx >= state.files.length - 1;
+  document.getElementById('prevPageBtn').disabled = state.currentPageIdx <= 0;
+  document.getElementById('nextPageBtn').disabled = !f || state.currentPageIdx >= f.pages.length - 1;
+}
+
+function updateButtons() {
+  const has = state.files.length > 0;
+  document.getElementById('btnProcess').disabled = !has || state.processing;
+  document.getElementById('btnRotate').disabled  = !has;
+  document.getElementById('btnClear').disabled   = !has;
+  updateNavButtons();
+}
+
+function clearAll() {
+  state.files = []; state.currentFileIdx = 0; state.currentPageIdx = 0;
+  state.results = []; state.currentResFileIdx = 0; state.currentResPageIdx = 0;
+  renderFileList(); showPreview(); updateButtons(); clearHighlights();
+  document.getElementById('resultEmpty').style.display = '';
+  document.getElementById('resultEmpty').innerHTML = `
+    <div class="result-empty-icon">📊</div>
+    <div style="font-size:13px;color:var(--muted)">Запустите анализ</div>
+    <div style="font-size:11px;color:var(--muted);margin-top:4px">Результаты появятся здесь</div>`;
+  document.getElementById('resultContent').style.display = 'none';
+  document.getElementById('resultNav').style.display = 'none';
+  document.getElementById('actionsRow').style.display = 'none';
+  clearLog(); setStatus('idle', 'Готов');
+}
+
+// ════════════════════════════════════════════════
+// HIGHLIGHT ENGINE
+// ════════════════════════════════════════════════
+
+// Field colours (consistent across both panels)
+const FIELD_COLORS = {
+  total:          { fill: 'rgba(79,142,247,0.25)',  stroke: 'rgba(79,142,247,0.9)',  label: 'Сумма' },
+  date:           { fill: 'rgba(45,212,160,0.25)',  stroke: 'rgba(45,212,160,0.9)',  label: 'Дата' },
+  company:        { fill: 'rgba(245,166,35,0.25)',  stroke: 'rgba(245,166,35,0.9)',  label: 'Компания' },
+  invoice_number: { fill: 'rgba(124,92,252,0.25)',  stroke: 'rgba(124,92,252,0.9)',  label: 'Номер счёта' },
+  vat:            { fill: 'rgba(247,111,111,0.25)', stroke: 'rgba(247,111,111,0.9)', label: 'НДС' },
+  currency:       { fill: 'rgba(45,212,160,0.18)',  stroke: 'rgba(45,212,160,0.6)',  label: 'Валюта' },
+};
+
+// Цвет для extra-полей (все одним цветом — жёлтый)
+const EXTRA_COLOR = { fill: 'rgba(245,166,35,0.2)', stroke: 'rgba(245,166,35,0.85)', label: '' };
+
+function getFieldColor(key) {
+  if (key.startsWith('extra::')) return EXTRA_COLOR;
+  return FIELD_COLORS[key] || { fill: 'rgba(255,255,255,0.15)', stroke: 'rgba(255,255,255,0.6)', label: key };
+}
+
+// Scale OCR pixel coords → canvas coords
+function scaleBlock(block) {
+  const scaleX = state.imgDisplayW / (state.imgNaturalW || 1);
+  const scaleY = state.imgDisplayH / (state.imgNaturalH || 1);
+  return {
+    x: block.left   * scaleX,
+    y: block.top    * scaleY,
+    w: block.width  * scaleX,
+    h: block.height * scaleY,
+  };
+}
+
+function drawBlock(ctx, block, fieldName) {
+  const color  = getFieldColor(fieldName);
+  const scaled = scaleBlock(block);
+  ctx.fillStyle   = color.fill;
+  ctx.strokeStyle = color.stroke;
+  ctx.lineWidth   = 2;
+  // Rounded rect
+  const r = 3;
+  ctx.beginPath();
+  ctx.moveTo(scaled.x + r, scaled.y);
+  ctx.lineTo(scaled.x + scaled.w - r, scaled.y);
+  ctx.quadraticCurveTo(scaled.x + scaled.w, scaled.y, scaled.x + scaled.w, scaled.y + r);
+  ctx.lineTo(scaled.x + scaled.w, scaled.y + scaled.h - r);
+  ctx.quadraticCurveTo(scaled.x + scaled.w, scaled.y + scaled.h, scaled.x + scaled.w - r, scaled.y + scaled.h);
+  ctx.lineTo(scaled.x + r, scaled.y + scaled.h);
+  ctx.quadraticCurveTo(scaled.x, scaled.y + scaled.h, scaled.x, scaled.y + scaled.h - r);
+  ctx.lineTo(scaled.x, scaled.y + r);
+  ctx.quadraticCurveTo(scaled.x, scaled.y, scaled.x + r, scaled.y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // Small label tag
+  const color2 = getFieldColor(fieldName);
+  const labelText = color2.label || (fieldName.startsWith('extra::') ? fieldName.replace('extra::', '') : fieldName);
+  if (labelText) {
+    ctx.fillStyle = color2.stroke;
+    ctx.font = 'bold 9px IBM Plex Mono, monospace';
+    ctx.fillText(labelText, scaled.x + 2, scaled.y - 2);
+  }
+}
+
+function redrawCanvas() {
+  const canvas = document.getElementById('highlightCanvas');
+  const ctx    = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!state.activeField && !state.activeBlock) return;
+
+  // Determine which field to highlight
+  let fieldName = null;
+  if (state.activeField) fieldName = state.activeField.fieldName;
+  else if (state.activeBlock) fieldName = state.activeBlock.fieldName;
+
+  if (!fieldName) return;
+
+  // Get blocks for current file/page
+  const mapping = getCurrentMapping();
+  if (!mapping) return;
+  const blocks = mapping[fieldName];
+  if (!blocks || blocks.length === 0) return;
+
+  blocks.forEach(block => drawBlock(ctx, block, fieldName));
+  document.getElementById('hlLegend').classList.add('visible');
+}
+
+function clearHighlights() {
+  state.activeField = null; state.activeBlock = null;
+  const canvas = document.getElementById('highlightCanvas');
+  const ctx    = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  document.getElementById('hlLegend').classList.remove('visible');
+  // Clear result field highlights
+  document.querySelectorAll('.result-field.hl-active').forEach(el => el.classList.remove('hl-active'));
+}
+
+function getCurrentMapping() {
+  const res = state.results[state.currentResFileIdx];
+  if (!res || !res.field_mappings) return null;
+  return res.field_mappings[state.currentResPageIdx] || null;
+}
+
+function getResultForFileIdx(fileIdx) {
+  return state.results[fileIdx] || null;
+}
+
+// ── Hover from result field → highlight on canvas ──────────────
+function onResultFieldEnter(fieldName) {
+  state.activeField = { fieldName };
+  state.activeBlock = null;
+  redrawCanvas();
+}
+
+function onResultFieldLeave() {
+  state.activeField = null;
+  redrawCanvas();
+}
+
+// ── Hover from OCR hit zone → highlight result field ───────────
+function onOcrBlockEnter(fieldName) {
+  state.activeBlock = { fieldName };
+  state.activeField = null;
+  redrawCanvas();
+  // Highlight the corresponding result field
+  document.querySelectorAll('.result-field.hl-active').forEach(el => el.classList.remove('hl-active'));
+  const el = document.querySelector(`.result-field[data-field="${fieldName}"]`);
+  if (el) {
+    el.classList.add('hl-active');
+    el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function onOcrBlockLeave() {
+  state.activeBlock = null;
+  redrawCanvas();
+  document.querySelectorAll('.result-field.hl-active').forEach(el => el.classList.remove('hl-active'));
+}
+
+// Build invisible hit divs over each OCR block that has a field mapping
+function rebuildOcrHitLayer() {
+  const layer = document.getElementById('ocrHitLayer');
+  layer.innerHTML = '';
+
+  const mapping = getCurrentMapping();
+  if (!mapping) return;
+
+  // Recompute display size (image may have just loaded)
+  const img = document.getElementById('previewImg');
+  if (!img.complete || !img.naturalWidth) return;
+  state.imgNaturalW = img.naturalWidth;
+  state.imgNaturalH = img.naturalHeight;
+  state.imgDisplayW = img.offsetWidth;
+  state.imgDisplayH = img.offsetHeight;
+
+  Object.entries(mapping).forEach(([fieldName, blocks]) => {
+    blocks.forEach(block => {
+      const scaled = scaleBlock(block);
+      const div = document.createElement('div');
+      div.className = 'ocr-hit';
+      div.style.left   = scaled.x + 'px';
+      div.style.top    = scaled.y + 'px';
+      div.style.width  = scaled.w + 'px';
+      div.style.height = scaled.h + 'px';
+      const fc = getFieldColor(fieldName);
+      div.title = fc.label || (fieldName.startsWith('extra::') ? fieldName.replace('extra::', '') : fieldName);
+      div.addEventListener('mouseenter', () => onOcrBlockEnter(fieldName));
+      div.addEventListener('mouseleave', () => onOcrBlockLeave());
+      layer.appendChild(div);
+    });
+  });
+}
+
+// ════════════════════════════════════════════════
+// PROCESSING
+// ════════════════════════════════════════════════
+async function startProcessing() {
+  if (state.files.length === 0 || state.processing) return;
+
+  // Только файлы которые ещё не обработаны (idle или error)
+  const toProcess = state.files.filter(f => f.status !== 'done');
+  if (toProcess.length === 0) {
+    showToast('Все файлы уже обработаны', 'info'); return;
+  }
+
+  state.processing = true;
+  // НЕ сбрасываем state.results — сохраняем уже готовые результаты
+  // Убеждаемся что results выровнен по files (заполняем null для уже готовых)
+  while (state.results.length < state.files.length) state.results.push(null);
+
+  setStatus('processing', 'Обработка...');
+  document.getElementById('btnProcess').disabled = true;
+  document.getElementById('processingOverlay').classList.add('active');
+  clearLog();
+
+  let newCount = 0;
+
+  for (let i = 0; i < state.files.length; i++) {
+    const f = state.files[i];
+
+    // Пропускаем уже обработанные
+    if (f.status === 'done') {
+      addLog(`⏩ Пропущен (уже обработан): ${f.name}`, 'info');
+      continue;
+    }
+
+    f.status = 'processing'; renderFileList();
+    addLog(`Файл ${i+1}/${state.files.length}: ${f.name}`, 'step');
+    document.getElementById('processingStep').textContent = `${i+1}/${state.files.length}: ${f.name}`;
+
+    try {
+      const result = await processFile(f);
+      f.status = 'done'; f.result = result;
+      state.results[i] = result;  // сохраняем по индексу, не push
+      if (result.logs) result.logs.forEach(l =>
+        addLog(l, l.includes('ОШИБКА')||l.includes('✗') ? 'error' : l.includes('ШАГ') ? 'step' : l.includes('ЗАВЕРШЕНА') ? 'success' : 'info')
+      );
+      addLog(`✓ ${f.name}: ${result.parsed_list.length} записей`, 'success');
+      newCount++;
+    } catch(e) {
+      f.status = 'error';
+      state.results[i] = { filename: f.name, parsed_list: [], logs: [], pages_blocks: [], field_mappings: [], error: String(e) };
+      addLog(`✗ ${f.name}: ${e}`, 'error');
+    }
+    renderFileList();
+  }
+
+  state.processing = false;
+  document.getElementById('processingOverlay').classList.remove('active');
+  document.getElementById('btnProcess').disabled = false;
+
+  // Показываем результаты начиная с первого нового файла (или первого вообще)
+  const firstNewIdx = state.files.findIndex(f => f.status === 'done' && state.results[state.files.indexOf(f)]);
+  if (firstNewIdx !== -1) {
+    state.currentResFileIdx = firstNewIdx;
+    state.currentResPageIdx = 0;
+  }
+
+  const hasResults = state.results.some(r => r && r.parsed_list && r.parsed_list.length > 0);
+  if (hasResults) {
+    document.getElementById('resultEmpty').style.display = 'none';
+    document.getElementById('resultContent').style.display = 'block';
+    document.getElementById('resultNav').style.display = 'flex';
+    document.getElementById('actionsRow').style.display = 'flex';
+    renderResult();
+    rebuildOcrHitLayer();
+  }
+
+  const doneCount = state.results.filter(r => r && r.parsed_list && r.parsed_list.length > 0).length;
+  setStatus(doneCount > 0 ? 'done' : 'error', doneCount > 0 ? 'Завершено' : 'Ошибки');
+  showToast(`Обработано новых: ${newCount}, всего готово: ${doneCount}/${state.files.length}`, doneCount > 0 ? 'success' : 'error');
+  loadHistory().catch(()=>{});
+}
+
+async function processFile(fileObj) {
+  const formData = new FormData();
+  formData.append('file', fileObj.file, fileObj.name);
+  const r = await fetch('/api/process', { method: 'POST', body: formData });
+  if (!r.ok) { const err = await r.json().catch(()=>({})); throw new Error(err.error || `HTTP ${r.status}`); }
+  return await r.json();
+}
+
+// ════════════════════════════════════════════════
+// RESULTS
+// ════════════════════════════════════════════════
+function navigateResultFile(dir) {
+  const newIdx = state.currentResFileIdx + dir;
+  if (newIdx < 0 || newIdx >= state.results.length) return;
+  state.currentResFileIdx = newIdx; state.currentResPageIdx = 0;
+  clearHighlights();
+  if (newIdx < state.files.length) {
+    state.currentFileIdx = newIdx; state.currentPageIdx = 0;
+    renderFileList(); showPreview(); updateNavButtons();
+  }
+  renderResult(); rebuildOcrHitLayer();
+}
+
+function navigateResultPage(dir) {
+  const res = state.results[state.currentResFileIdx];
+  if (!res) return;
+  const newIdx = state.currentResPageIdx + dir;
+  if (newIdx < 0 || newIdx >= res.parsed_list.length) return;
+  state.currentResPageIdx = newIdx; clearHighlights();
+  const f = state.files[state.currentFileIdx];
+  if (f && newIdx < f.pages.length) { state.currentPageIdx = newIdx; showPreview(); updateNavButtons(); }
+  renderResult(); rebuildOcrHitLayer();
+}
+
+function renderResult() {
+  const res   = state.results[state.currentResFileIdx];
+  const empty = document.getElementById('resultEmpty');
+  const cont  = document.getElementById('resultContent');
+
+  if (!res) { empty.style.display=''; cont.style.display='none'; return; }
+
+  if (res.error && res.parsed_list.length === 0) {
+    empty.style.display=''; cont.style.display='none';
+    empty.innerHTML=`<div class="result-empty-icon" style="opacity:1">⚠</div><div style="font-size:13px;color:var(--red)">${escHtml(res.error)}</div>`;
+    document.getElementById('resultCounter').textContent='—'; return;
+  }
+  if (res.parsed_list.length === 0) {
+    empty.style.display=''; cont.style.display='none';
+    empty.innerHTML=`<div class="result-empty-icon">🔍</div><div style="font-size:13px;color:var(--muted)">Данные не найдены</div>`; return;
+  }
+
+  empty.style.display='none'; cont.style.display='block';
+
+  const parsed = res.parsed_list[state.currentResPageIdx];
+  const fi = state.currentResFileIdx+1, ft = state.results.length;
+  const pi = state.currentResPageIdx+1, pt = res.parsed_list.length;
+  const mapping = getCurrentMapping() || {};
+
+  document.getElementById('resultCounter').textContent = `${fi}/${ft} · стр.${pi}/${pt}`;
+  document.getElementById('resultFileCounter').textContent = `${fi} / ${ft}`;
+  document.getElementById('resultPageCounter').textContent = `стр.${pi}/${pt}`;
+  document.getElementById('resultFileName').textContent = res.filename || '—';
+  document.getElementById('prevResFileBtn').disabled = state.currentResFileIdx <= 0;
+  document.getElementById('nextResFileBtn').disabled = state.currentResFileIdx >= state.results.length-1;
+  document.getElementById('prevResPageBtn').disabled = state.currentResPageIdx <= 0;
+  document.getElementById('nextResPageBtn').disabled = state.currentResPageIdx >= pt-1;
+
+  const isValid = parsed.validation_valid;
+  const errors  = parsed.validation_errors || [];
+  const category = parsed.category || 'прочее';
+  const docType  = parsed.document_type || null;
+  const extraFields = parsed.extra_fields || {};
+
+  // ── Иконки по типу документа ──
+  const docTypeIcons = {
+    'кассовый чек': '🧾', 'товарный чек': '🛍', 'банковская квитанция': '🏦',
+    'квитанция': '🏦', 'счёт-фактура': '📋', 'счёт': '📄',
+    'платёжное поручение': '💳', 'накладная': '📦', 'акт': '📝',
+  };
+  const docIcon = docType
+    ? (docTypeIcons[docType.toLowerCase()] || '📄')
+    : '📄';
+
+  // ── Базовые поля (только непустые) ──
+  const coreFields = [
+    { key: 'total',          label: 'Итого',        cls: 'big', suffix: ` ${escHtml(parsed.currency||'RUB')}` },
+    { key: 'date',           label: 'Дата',          cls: '' },
+    { key: 'company',        label: 'Компания',      cls: '' },
+    { key: 'invoice_number', label: 'Номер',         cls: '' },
+    { key: 'vat',            label: 'НДС',           cls: '' },
+  ];
+
+  function buildFieldRow(key, label, val, cls, suffix) {
+    if (!val) return '';
+    const hasMapping = mapping[key] && mapping[key].length > 0;
+    const dot = hasMapping
+      ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:${FIELD_COLORS[key]?.stroke||'#fff'};margin-right:5px;flex-shrink:0;margin-bottom:1px"></span>`
+      : '';
+    const hover = hasMapping
+      ? `onmouseenter="onResultFieldEnter('${key}')" onmouseleave="onResultFieldLeave()"`
+      : '';
+    const tooltip = hasMapping
+      ? `<span class="field-tooltip" style="color:${FIELD_COLORS[key]?.stroke}">↔ подсветить</span>`
+      : '';
+    return `
+      <div class="result-field" data-field="${key}" ${hover}>
+        <span class="result-field-key">${dot}${escHtml(label)}</span>
+        <span class="result-field-val ${cls}">${escHtml(String(val))}${suffix ? `<span style="font-size:12px;color:var(--muted);margin-left:4px">${suffix}</span>` : ''}</span>
+        ${tooltip}
+      </div>`;
+  }
+
+  const coreRows = coreFields
+    .map(f => buildFieldRow(f.key, f.label, parsed[f.key], f.cls, f.suffix||''))
+    .filter(Boolean)
+    .join('');
+
+  // ── Дополнительные поля (extra_fields) ──
+  const extraRows = Object.entries(extraFields).map(([k, v]) => {
+    const mapKey = `extra::${k}`;
+    const hasMap = mapping[mapKey] && mapping[mapKey].length > 0;
+    const dot = hasMap
+      ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:rgba(245,166,35,0.9);margin-right:5px;flex-shrink:0;margin-bottom:1px"></span>`
+      : '';
+    const hover = hasMap
+      ? `onmouseenter="onResultFieldEnter('${mapKey}')" onmouseleave="onResultFieldLeave()"`
+      : '';
+    const tooltip = hasMap
+      ? `<span class="field-tooltip" style="color:rgba(245,166,35,0.9)">↔ подсветить</span>`
+      : '';
+    return `
+      <div class="result-field extra-field" data-field="${mapKey}" ${hover}>
+        <span class="result-field-key" style="color:var(--muted)">${dot}${escHtml(k)}</span>
+        <span class="result-field-val" style="font-size:12px">${escHtml(String(v))}</span>
+        ${tooltip}
+      </div>`;
+  }).join('');
+
+  const hasExtra = extraRows.length > 0;
+
+  cont.innerHTML = `
+    <div class="result-card">
+      <div class="result-card-header">
+        <span class="result-card-title">
+          ${docIcon} ${docType ? escHtml(docType) : `Документ ${fi}/${ft}`}
+          ${ft > 1 || pt > 1 ? `<span style="color:var(--border);margin-left:6px">${fi}/${ft} · стр.${pi}/${pt}</span>` : ''}
+        </span>
+        <span class="category-tag">🏷 ${escHtml(category)}</span>
+      </div>
+
+      <div class="result-fields">
+        ${coreRows || '<div style="padding:8px;color:var(--muted);font-size:12px">Основные поля не найдены</div>'}
+      </div>
+
+      ${hasExtra ? `
+      <div style="border-top:1px solid var(--border);margin:0 14px"></div>
+      <div style="padding:6px 14px 4px;font-family:var(--mono);font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted)">
+        Дополнительно
+      </div>
+      <div class="result-fields" style="padding-top:4px">${extraRows}</div>
+      ` : ''}
+
+      <div class="validation-block ${isValid?'valid':'invalid'}">
+        <div class="validation-status ${isValid?'valid':'invalid'}">
+          ${isValid ? '✓ Валидация пройдена' : '✗ Ошибки валидации'}
+        </div>
+        ${errors.length ? `<div class="validation-errors">${errors.map(e=>`<div class="validation-err-item">${escHtml(e)}</div>`).join('')}</div>` : ''}
+      </div>
+    </div>
+
+    ${res.doc_id ? `<div style="padding:4px 0 6px;font-size:11px;color:var(--muted);font-family:var(--mono)">ID в базе: <span style="color:var(--accent)">#${res.doc_id}</span></div>` : ''}
+    ${Object.keys(mapping).length > 0 ? `<div style="font-size:10px;color:var(--muted);font-family:var(--mono)">↔ Наведите на поле — подсветится в документе</div>` : ''}
+  `;
+}
+
+
+// ════════════════════════════════════════════════
+// LOG
+// ════════════════════════════════════════════════
+let logLines = 0;
+function addLog(msg, type='info') {
+  const body = document.getElementById('logBody');
+  const ts   = new Date().toLocaleTimeString('ru',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const div  = document.createElement('div');
+  div.className = 'log-line ' + type;
+  div.innerHTML = `<span class="ts">${ts}</span><span class="msg">${escHtml(msg)}</span>`;
+  body.appendChild(div); body.scrollTop = body.scrollHeight;
+  logLines++;
+  document.getElementById('logCount').textContent = logLines + ' записей';
+}
+function clearLog() {
+  logLines = 0; document.getElementById('logBody').innerHTML = '';
+  document.getElementById('logCount').textContent = '0 записей';
+}
+function toggleLog() {
+  state.logCollapsed = !state.logCollapsed;
+  document.getElementById('logBody').classList.toggle('hidden', state.logCollapsed);
+  document.getElementById('logToggle').classList.toggle('collapsed', state.logCollapsed);
+}
+
+// ════════════════════════════════════════════════
+// STATUS / EXPORT / HISTORY / MODAL / TOAST / UTILS
+// ════════════════════════════════════════════════
+function setStatus(type, text) {
+  const el = document.getElementById('globalStatus');
+  el.className = 'status-chip ' + type;
+  el.innerHTML = `<div class="status-dot"></div><span>${text}</span>`;
+}
+
+function exportJSON() {
+  const res = state.results[state.currentResFileIdx];
+  if (!res) return;
+  const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = `result_${res.filename||'document'}.json`; a.click();
+  showToast('JSON сохранён', 'success');
+}
+
+function copyResult() {
+  const res = state.results[state.currentResFileIdx];
+  if (!res) return;
+  navigator.clipboard.writeText(JSON.stringify(res.parsed_list[state.currentResPageIdx], null, 2))
+    .then(()=>showToast('Скопировано', 'success'))
+    .catch(()=>showToast('Ошибка копирования', 'error'));
+}
+
+async function loadHistory() {
+  try {
+    const r = await fetch('/api/history');
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    state.history = await r.json(); renderHistory(state.history);
+  } catch(e) {
+    document.getElementById('historyBody').innerHTML =
+      `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">Ошибка: ${escHtml(e.message)}</td></tr>`;
+  }
+}
+
+function renderHistory(docs) {
+  const body = document.getElementById('historyBody');
+  if (!docs||docs.length===0) { body.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">История пуста</td></tr>'; return; }
+  body.innerHTML = docs.map(d=>`
+    <tr onclick="viewDoc(${d.id})" data-id="${d.id}">
+      <td class="id">#${d.id}</td>
+      <td class="filename" title="${escHtml(d.filename)}">${escHtml(d.filename)}</td>
+      <td class="date">${escHtml(d.date||'—')}</td>
+      <td class="amount">${escHtml(String(d.total||'—'))} ${escHtml(d.currency||'')}</td>
+      <td><span class="category-tag" style="font-size:10px">${escHtml(d.category||'прочее')}</span></td>
+    </tr>`).join('');
+}
+
+function filterHistory() {
+  const q = document.getElementById('historySearch').value.toLowerCase();
+  if (!q) { renderHistory(state.history); return; }
+  renderHistory(state.history.filter(d=>
+    (d.filename||'').toLowerCase().includes(q)||(d.category||'').toLowerCase().includes(q)||String(d.total||'').includes(q)));
+}
+
+async function viewDoc(id) {
+  try {
+    const r = await fetch('/api/document/'+id);
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const data = await r.json();
+    document.getElementById('modalTitle').textContent = `Документ #${id} — ${data.filename||''}`;
+    document.getElementById('modalBody').textContent  = JSON.stringify(data.parsed, null, 2);
+    document.getElementById('modalOverlay').classList.add('open');
+  } catch(e) { showToast('Ошибка: '+e.message, 'error'); }
+}
+
+async function deleteSelected() {
+  const sel = document.querySelector('#historyBody tr.selected');
+  if (!sel) { showToast('Выберите строку', 'info'); return; }
+  const id = sel.dataset.id;
+  if (!confirm(`Удалить документ #${id}?`)) return;
+  try {
+    const r = await fetch('/api/document/'+id, {method:'DELETE'});
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    showToast('Документ удалён', 'success'); loadHistory();
+  } catch(e) { showToast('Ошибка: '+e.message, 'error'); }
+}
+
+document.getElementById('historyBody').addEventListener('click', e => {
+  const tr = e.target.closest('tr[data-id]'); if (!tr) return;
+  document.querySelectorAll('#historyBody tr').forEach(r=>r.classList.remove('selected'));
+  tr.classList.add('selected');
+});
+
+function closeModal() { document.getElementById('modalOverlay').classList.remove('open'); }
+function closeModalOutside(e) { if(e.target===document.getElementById('modalOverlay')) closeModal(); }
+
+function showToast(msg, type='info') {
+  const c = document.getElementById('toastContainer');
+  const t = document.createElement('div');
+  t.className = 'toast '+type;
+  const icons={success:'✓',error:'✗',info:'ℹ'};
+  t.innerHTML=`<span>${icons[type]||''}</span><span>${escHtml(msg)}</span>`;
+  c.appendChild(t); setTimeout(()=>t.remove(), 3500);
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Init
+updateButtons();
+</script>
+</body>
+</html>
+
+
+=== FILE: ./preprocessing/preprocessor.py ===
+import os
+from PIL import Image, ImageEnhance
+
+
+def preprocess_image(file_path):
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = os.path.join(base_dir, "data")
+
+    if not os.path.exists(data_dir):
+        os.makedirs(data_dir)
+
+    img = Image.open(file_path)
+
+    img = img.convert("L")
+
+    img = ImageEnhance.Contrast(img).enhance(3.0)
+
+    img = ImageEnhance.Sharpness(img).enhance(2.0)
+
+
+    threshold = 140
+    img = img.point(lambda p: 255 if p > threshold else 0)
+    img = img.convert("L")
+
+    save_path = os.path.join(data_dir, "temp_proc.png")
+    img.save(save_path)
+    return save_path
+
+
+=== FILE: ./translation/translator.py ===
+import re
+from deep_translator import GoogleTranslator
+
+
+def normalize_data(text):
+    if not text:
+        return ""
+
+    # === НАЧАЛО БЛОКА: ИСПРАВЛЕНИЕ OCR-ОШИБОК ВАЛЮТ ===
+    # Очищаем строку от пробелов и переводим в верхний регистр для точного сравнения
+    cleaned_currency = str(text).strip().upper()
+    
+    # Если Tesseract перепутал буквы и прочитал BYN как ВУМ/VUM/БУН/ВУН, 
+    # мы возвращаем чистый, правильный ISO-код BYN
+    if cleaned_currency in ['ВУМ', 'VUM', 'БУН', 'BYM', 'ВУН', 'BYN']:
+        return 'BYN'
+        
+    # То же самое делаем для других стандартных валют на случай лишних пробелов
+    if cleaned_currency in ['RUB', 'РУБ', 'РУБ.']:
+        return 'RUB'
+    if cleaned_currency in ['USD', 'EUR', 'KZT']:
+        return cleaned_currency
+    # === КОНЕЦ БЛОКА ===
+
+    # ТВОЙ СТАРЫЙ КОД (ОСТАЛСЯ ПОЛНОСТЬЮ БЕЗ ИЗМЕНЕНИЙ)
+    text = text.replace("долларов США", "$").replace("доллара", "$").replace("доллар", "$")
+    text = text.replace("евро", "€")
+
+    months = {
+        "января": "01", "февраля": "02", "марта": "03", "апреля": "04",
+        "мая": "05", "июня": "06", "июля": "07", "августа": "08",
+        "сентября": "09", "октября": "10", "ноября": "11", "декабря": "12",
+    }
+    for name, num in months.items():
+        text = re.sub(rf"(\d{{1,2}})\s{name}\s(\d{{4}})", rf"\1.{num}.\2", text, flags=re.IGNORECASE)
+
+    date_pattern = r"(\d{2,4})[-/](\d{2})[-/](\d{2,4})"
+
+    def date_fixer(match):
+        g1, g2, g3 = match.groups()
+        if len(g1) == 4:
+            return f"{g3}.{g2}.{g1}"
+        return f"{g1}.{g2}.{g3}"
+
+    return re.sub(date_pattern, date_fixer, text)
+
+
+def translate_field(text):
+    print(r"=== ВХОД В ПЕРЕВОДЧИК ===", repr(text))  # Покажет, что прислал ИИ
+    
+    if not text:
+        return ""
+        
+    cleaned_text = str(text).strip().upper()
+    ISO_CURRENCIES = ['USD', 'EUR', 'BYN', 'RUB', 'KZT', 'UAH']
+    
+    if cleaned_text in ISO_CURRENCIES:
+        print(r"=== СРАБОТАЛ ФИЛЬТР ВАЛЮТ ===", cleaned_text)
+        return cleaned_text
+
+    try:
+        translated = GoogleTranslator(source="auto", target="ru").translate(text)
+        res = normalize_data(translated)
+        print(r"=== ВЫХОД ИЗ ПЕРЕВОДЧИКА (УСПЕХ) ===", repr(res))
+        return res
+    except:
+        res = normalize_data(text)
+        print(r"=== ВЫХОД ИЗ ПЕРЕВОДЧИКА (ОШИБКА) ===", repr(res))
+        return res
+
+
+=== FILE: ./gui/gui.py ===
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageTk
+import os
+import json
+from pdf2image import convert_from_path
+
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from orchestrator.orchestrator import Orchestrator
+from ocr.ocr_module import OCRModule
+from llm.llm_agent import LLMAgent
+from db.db_module import DatabaseModule
+from agents.classification_agent import ClassificationAgent
+from agents.validation_agent import ValidationAgent
+from llm.llm_client import LLMClient
+from translation.translator import translate_field
+import yaml
+
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Обработка финансовых документов")
+        self.geometry("1300x750")
+        self.configure(bg="#e0e0e0")
+
+        self.ocr = OCRModule()
+        self.llm_agent = LLMAgent()
+        self.db = DatabaseModule(config['database']['file'])
+        self.classifier = ClassificationAgent(LLMClient())
+        self.validator = ValidationAgent()
+
+        self.orchestrator = Orchestrator(
+            ocr_module=self.ocr,
+            llm_agent=self.llm_agent,
+            db_module=self.db,
+            classifier=self.classifier,
+            validator=self.validator,
+            translator_func=translate_field if config['app'].get('show_translation', True) else None
+        )
+
+        self.current_file = None
+        self.current_image_tk = None
+        self.rotation = 0
+        self.current_result = None
+        self.current_parsed_list = []
+        self.current_page_index = 0
+
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.tab_process = tk.Frame(self.notebook, bg="#e0e0e0")
+        self.tab_history = tk.Frame(self.notebook, bg="#e0e0e0")
+        self.notebook.add(self.tab_process, text="ОБРАБОТКА")
+        self.notebook.add(self.tab_history, text="ИСТОРИЯ")
+
+        self.setup_process_tab()
+        self.setup_history_tab()
+        self.refresh_history()
+
+    def setup_process_tab(self):
+        left_frame = tk.Frame(self.tab_process, bg="#ffffff", relief="groove", bd=1)
+        left_frame.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(left_frame, text="ВЫБОР ДОКУМЕНТА", font=("Arial", 12, "bold"),
+                 bg="#ffffff", fg="#000000").pack(pady=(15, 5))
+
+        self.btn_select = tk.Button(left_frame, text="ВЫБРАТЬ ФАЙЛ", command=self.select_file,
+                                    bg="#d9d9d9", fg="#000000", font=("Arial", 11, "bold"),
+                                    padx=20, pady=8, relief="raised", bd=2)
+        self.btn_select.pack(pady=10, padx=20, fill="x")
+
+        self.file_label = tk.Label(left_frame, text="Файл не выбран", bg="#ffffff", fg="#555555",
+                                   font=("Arial", 10), wraplength=250)
+        self.file_label.pack(pady=5, padx=20, fill="x")
+
+        self.btn_rotate = tk.Button(left_frame, text="⟳ ПОВЕРНУТЬ", command=self.rotate_image,
+                                    bg="#d9d9d9", fg="#000000", font=("Arial", 10),
+                                    padx=20, pady=6, relief="raised", bd=2, state="disabled")
+        self.btn_rotate.pack(pady=5, padx=20, fill="x")
+
+        tk.Frame(left_frame, bg="#cccccc", height=2).pack(fill="x", padx=20, pady=10)
+
+        tk.Label(left_frame, text="ПРЕДПРОСМОТР", font=("Arial", 11, "bold"),
+                 bg="#ffffff", fg="#000000").pack(pady=(10, 5))
+
+        self.preview_area = tk.Label(left_frame, text="Здесь будет изображение",
+                                     bg="#f5f5f5", fg="#666666", font=("Arial", 10),
+                                     width=40, height=12, relief="sunken", bd=1)
+        self.preview_area.pack(pady=10, padx=20, fill="both", expand=True)
+
+        tk.Frame(left_frame, bg="#cccccc", height=2).pack(fill="x", padx=20, pady=10)
+
+        self.btn_process = tk.Button(left_frame, text="ЗАПУСТИТЬ АНАЛИЗ", command=self.start_processing,
+                                     bg="#2e7d32", fg="#000000", font=("Arial", 12, "bold"),
+                                     padx=30, pady=10, relief="raised", bd=2, state="disabled")
+        self.btn_process.pack(pady=15, padx=20, fill="x")
+
+        right_frame = tk.Frame(self.tab_process, bg="#ffffff", relief="groove", bd=1)
+        right_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
+
+        tk.Label(right_frame, text="РЕЗУЛЬТАТ АНАЛИЗА", font=("Arial", 12, "bold"),
+                 bg="#ffffff", fg="#000000").pack(pady=(15, 5))
+
+        nav_frame = tk.Frame(right_frame, bg="#ffffff")
+        nav_frame.pack(fill="x", padx=15, pady=(0, 5))
+
+        tk.Label(nav_frame, text="Страница / счёт:", bg="#ffffff", font=("Arial", 10)).pack(side="left", padx=(0, 10))
+
+        self.page_var = tk.StringVar(value="1")
+        self.page_spinbox = tk.Spinbox(nav_frame, from_=1, to=1, width=5,
+                                       textvariable=self.page_var,
+                                       command=self.on_page_change,
+                                       font=("Arial", 10))
+        self.page_spinbox.pack(side="left", padx=(0, 10))
+
+        self.total_pages_label = tk.Label(nav_frame, text="из 1", bg="#ffffff", font=("Arial", 10))
+        self.total_pages_label.pack(side="left")
+
+        self.btn_refresh_page = tk.Button(nav_frame, text="Обновить", command=self.on_page_change,
+                                          bg="#d9d9d9", fg="#000000", font=("Arial", 9),
+                                          padx=10, pady=2, relief="raised", bd=1)
+        self.btn_refresh_page.pack(side="right", padx=(10, 0))
+
+        self.result_text = tk.Text(right_frame, wrap="word", font=("Courier New", 10),
+                                   bg="#fafafa", fg="#000000", relief="sunken", bd=1)
+        self.result_text.pack(fill="both", expand=True, padx=15, pady=10)
+
+        bottom_frame = tk.Frame(self.tab_process, bg="#ffffff", relief="groove", bd=1)
+        bottom_frame.pack(side="bottom", fill="x", padx=10, pady=(0, 10))
+
+        tk.Label(bottom_frame, text="ЛОГ ОБРАБОТКИ", font=("Arial", 10, "bold"),
+                 bg="#ffffff", fg="#000000").pack(anchor="w", padx=15, pady=(10, 5))
+
+        self.log_text = tk.Text(bottom_frame, wrap="word", font=("Courier New", 9),
+                                bg="#f5f5f5", fg="#000000", relief="sunken", bd=1, height=30)
+        self.log_text.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+
+        self.btn_export = tk.Button(bottom_frame, text="СОХРАНИТЬ КАК JSON", command=self.export_json,
+                                    bg="#f57c00", fg="#ffffff", font=("Arial", 10, "bold"),
+                                    padx=20, pady=6, relief="raised", bd=2, state="disabled")
+        self.btn_export.pack(pady=(0, 10))
+
+    def setup_history_tab(self):
+        columns = ("ID", "Файл", "Дата", "Сумма", "Категория")
+        self.history_tree = ttk.Treeview(self.tab_history, columns=columns, show="headings", height=18)
+
+        self.history_tree.heading("ID", text="ID")
+        self.history_tree.heading("Файл", text="Файл")
+        self.history_tree.heading("Дата", text="Дата обработки")
+        self.history_tree.heading("Сумма", text="Сумма")
+        self.history_tree.heading("Категория", text="Категория")
+
+        self.history_tree.column("ID", width=50)
+        self.history_tree.column("Файл", width=400)
+        self.history_tree.column("Дата", width=130)
+        self.history_tree.column("Сумма", width=100)
+        self.history_tree.column("Категория", width=130)
+
+        scrollbar = ttk.Scrollbar(self.tab_history, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.history_tree.pack(side="left", fill="both", expand=True, padx=10, pady=10)
+        scrollbar.pack(side="right", fill="y", pady=10)
+
+        btn_frame = tk.Frame(self.tab_history, bg="#e0e0e0")
+        btn_frame.pack(fill="x", padx=10, pady=5)
+
+        tk.Button(btn_frame, text="ПРОСМОТРЕТЬ", command=self.view_document,
+                  bg="#1976d2", fg="#000000", font=("Arial", 10, "bold"),
+                  padx=15, pady=5, relief="raised", bd=2).pack(side="left", padx=5)
+
+        tk.Button(btn_frame, text="УДАЛИТЬ", command=self.delete_document,
+                  bg="#c62828", fg="#000000", font=("Arial", 10, "bold"),
+                  padx=15, pady=5, relief="raised", bd=2).pack(side="left", padx=5)
+
+        tk.Button(btn_frame, text="ОБНОВИТЬ", command=self.refresh_history,
+                  bg="#616161", fg="#000000", font=("Arial", 10, "bold"),
+                  padx=15, pady=5, relief="raised", bd=2).pack(side="left", padx=5)
+
+        self.history_tree.bind("<Double-1>", self.on_history_double_click)
+        self.history_tree.bind("<<TreeviewSelect>>", lambda e: None)
+
+    def on_history_double_click(self, event):
+        selected = self.history_tree.selection()
+        if not selected:
+            return
+        item = self.history_tree.item(selected[0])
+        doc_id = item['values'][0]
+        data = self.db.get_one(doc_id)
+        if data:
+            _, parsed = data
+            win = tk.Toplevel(self)
+            win.title(f"Документ ID {doc_id} - Просмотр")
+            win.geometry("700x600")
+            win.configure(bg="#e0e0e0")
+
+            text = tk.Text(win, wrap="word", font=("Courier New", 10),
+                           bg="#ffffff", fg="#000000")
+            text.pack(fill="both", expand=True, padx=10, pady=10)
+            text.insert("1.0", json.dumps(parsed, indent=2, ensure_ascii=False))
+            text.config(state="disabled")
+
+            tk.Button(win, text="ЗАКРЫТЬ", command=win.destroy,
+                      bg="#d9d9d9", fg="#000000", font=("Arial", 10, "bold"),
+                      padx=20, pady=5, relief="raised", bd=2).pack(pady=10)
+
+    def select_file(self):
+        file = filedialog.askopenfilename(
+            filetypes=[("Изображения и PDF", "*.png *.jpg *.jpeg *.pdf"), ("Все файлы", "*.*")]
+        )
+        if file:
+            self.current_file = file
+            self.rotation = 0
+            self.file_label.config(text=os.path.basename(file), fg="#2e7d32", font=("Arial", 10, "bold"))
+            self.btn_process.config(state="normal")
+            self.btn_rotate.config(state="normal")
+            self.show_preview()
+            self.log_text.delete("1.0", "end")
+            self.result_text.delete("1.0", "end")
+            self.log_text.insert("1.0", "✓ Файл выбран: " + os.path.basename(file) + "\n")
+            self.log_text.insert("1.0", "▶ Нажмите 'ЗАПУСТИТЬ АНАЛИЗ'\n\n")
+
+    def get_image(self):
+        if self.current_file and self.current_file.lower().endswith(".pdf"):
+            images = convert_from_path(self.current_file, first_page=1, last_page=1)
+            img = images[0]
+        elif self.current_file:
+            img = Image.open(self.current_file)
+        else:
+            return None
+        if self.rotation != 0:
+            img = img.rotate(self.rotation, expand=True)
+        return img
+
+    def show_preview(self):
+        try:
+            img = self.get_image()
+            if img:
+                img.thumbnail((350, 250), Image.Resampling.LANCZOS)
+                self.current_image_tk = ImageTk.PhotoImage(img)
+                self.preview_area.config(image=self.current_image_tk, text="")
+            else:
+                self.preview_area.config(image="", text="Не удалось загрузить изображение")
+        except Exception as e:
+            self.preview_area.config(image="", text=f"Ошибка: {e}")
+
+    def rotate_image(self):
+        self.rotation = (self.rotation + 90) % 360
+        self.show_preview()
+
+    def start_processing(self):
+        if not self.current_file:
+            return
+
+        self.btn_process.config(state="disabled", text="ОБРАБОТКА...")
+        self.update_idletasks()
+
+        try:
+            result = self.orchestrator.process_document(self.current_file, os.path.basename(self.current_file))
+            self.show_result(result)
+        except Exception as e:
+            self.show_error(str(e))
+        finally:
+            self.btn_process.config(state="normal", text="ЗАПУСТИТЬ АНАЛИЗ")
+
+    def display_parsed_item(self, parsed, index, total):
+        self.result_text.delete("1.0", "end")
+
+        category = parsed.get('category', 'N/A')
+        validation_valid = parsed.get('validation_valid', False)
+        validation_errors = parsed.get('validation_errors', [])
+
+        output = f"""
+╔════════════════════════════════════════════════════════════════╗
+║                   РЕЗУЛЬТАТ АНАЛИЗА (стр. {index + 1} из {total})              ║
+╚════════════════════════════════════════════════════════════════╝
+
+  Категория:      {str(category).upper()}
+  Сумма:          {parsed.get('total', 'N/A')} {parsed.get('currency', 'RUB')}
+  Дата:           {parsed.get('date', 'N/A')}
+  Компания:       {parsed.get('company', 'N/A')}
+  Номер счёта:    {parsed.get('invoice_number', 'N/A')}
+  НДС:            {parsed.get('vat', 'N/A')}
+
+╔════════════════════════════════════════════════════════════════╗
+║                           ВАЛИДАЦИЯ                            ║
+╚════════════════════════════════════════════════════════════════╝
+
+  Статус:           {'✓ ПРОЙДЕНА' if validation_valid else '✗ НЕ ПРОЙДЕНА'}
+
+"""
+        if validation_errors:
+            output += "\n  Ошибки:\n"
+            for err in validation_errors:
+                output += f"    • {err}\n"
+
+        self.result_text.insert("1.0", output)
+
+    def on_page_change(self):
+        if not self.current_parsed_list:
+            return
+
+        try:
+            page_num = int(self.page_var.get())
+        except ValueError:
+            page_num = 1
+
+        total = len(self.current_parsed_list)
+        if page_num < 1:
+            page_num = 1
+        elif page_num > total:
+            page_num = total
+
+        self.page_var.set(str(page_num))
+        self.current_page_index = page_num - 1
+
+        self.display_parsed_item(
+            self.current_parsed_list[self.current_page_index],
+            self.current_page_index,
+            total
+        )
+
+    def show_result(self, result):
+        self.result_text.delete("1.0", "end")
+
+        parsed_list = result.get('parsed_list', [])
+        self.current_parsed_list = parsed_list
+        self.current_page_index = 0
+
+        total = len(parsed_list)
+
+        if total == 0:
+            self.result_text.insert("1.0", "Не удалось извлечь данные из документа")
+            self.page_spinbox.config(from_=1, to=1, state="disabled")
+            self.total_pages_label.config(text="из 1")
+            return
+
+        self.page_spinbox.config(from_=1, to=total, state="normal")
+        self.total_pages_label.config(text=f"из {total}")
+        self.page_var.set("1")
+
+        self.display_parsed_item(parsed_list[0], 0, total)
+
+        self.log_text.delete("1.0", "end")
+        for log in result.get('logs', []):
+            self.log_text.insert("end", f"{log}\n")
+
+        self.btn_export.config(state="normal")
+        self.current_result = result
+        self.refresh_history()
+
+    def show_error(self, error):
+        self.result_text.delete("1.0", "end")
+        self.result_text.insert("1.0", f"ОШИБКА:\n{error}")
+        self.log_text.insert("end", f"\nОшибка: {error}\n")
+
+    def export_json(self):
+        if hasattr(self, 'current_result') and self.current_result:
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".json",
+                filetypes=[("JSON файлы", "*.json")],
+                initialfile=f"result_{self.current_result.get('doc_id', 'unknown')}.json"
+            )
+            if file_path:
+                export_data = {
+                    "doc_id": self.current_result.get('doc_id'),
+                    "filename": self.current_result.get('filename'),
+                    "parsed_list": self.current_result.get('parsed_list', []),
+                    "logs": self.current_result.get('logs', [])
+                }
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(export_data, f, indent=2, ensure_ascii=False)
+                messagebox.showinfo("Успех", "Результат сохранён")
+
+    def refresh_history(self):
+        for row in self.history_tree.get_children():
+            self.history_tree.delete(row)
+
+        docs = self.db.get_all()
+        for doc in docs:
+            doc_id, filename, created_at = doc
+            data = self.db.get_one(doc_id)
+            if data:
+                _, parsed = data
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    total = parsed[0].get('total', 'N/A')
+                    category = parsed[0].get('category', 'N/A')
+                else:
+                    total = parsed.get('total', 'N/A')
+                    category = parsed.get('category', 'N/A')
+                date_short = created_at[:10] if created_at else 'N/A'
+                self.history_tree.insert("", "end", values=(doc_id, filename, date_short, total, category))
+
+    def view_document(self):
+        selected = self.history_tree.selection()
+        if not selected:
+            messagebox.showinfo("Информация", "Выберите документ")
+            return
+        item = self.history_tree.item(selected[0])
+        doc_id = item['values'][0]
+        data = self.db.get_one(doc_id)
+        if data:
+            _, parsed = data
+            win = tk.Toplevel(self)
+            win.title(f"Документ ID {doc_id} - Просмотр")
+            win.geometry("800x600")
+            win.configure(bg="#e0e0e0")
+
+            from tkinter import scrolledtext
+            text = scrolledtext.ScrolledText(win, wrap="word", font=("Courier New", 10),
+                                             bg="#ffffff", fg="#000000")
+            text.pack(fill="both", expand=True, padx=10, pady=10)
+
+            if isinstance(parsed, list):
+                output = json.dumps(parsed, indent=2, ensure_ascii=False)
+            else:
+                output = json.dumps(parsed, indent=2, ensure_ascii=False)
+
+            text.insert("1.0", output)
+            text.config(state="disabled")
+
+            tk.Button(win, text="ЗАКРЫТЬ", command=win.destroy,
+                      bg="#d9d9d9", fg="#000000", font=("Arial", 10, "bold"),
+                      padx=20, pady=5, relief="raised", bd=2).pack(pady=10)
+
+    def delete_document(self):
+        selected = self.history_tree.selection()
+        if not selected:
+            messagebox.showinfo("Информация", "Выберите документ")
+            return
+        item = self.history_tree.item(selected[0])
+        doc_id = item['values'][0]
+        if messagebox.askyesno("Подтверждение", f"Удалить документ ID {doc_id}?"):
+            self.db.delete(doc_id)
+            self.refresh_history()
+            messagebox.showinfo("Успех", "Документ удалён")
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
+=== FILE: ./orchestrator/orchestrator.py ===
+import logging
+import os
+import sys
+import re
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from preprocessing.preprocessor import preprocess_image
+from translation.translator import normalize_data
+
+import yaml
+
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+
+class Orchestrator:
+    def __init__(self, ocr_module, llm_agent, db_module, classifier, validator,
+                 translator_func=None):
+        self.ocr = ocr_module
+        self.llm = llm_agent
+        self.db = db_module
+        self.classifier = classifier
+        self.validator = validator
+        self.translator = translator_func
+
+    def process_document(self, file_path, filename):
+        logs = []
+        doc_id = None
+
+        try:
+            logs.append(f"НАЧАЛО ОБРАБОТКИ: {filename}")
+
+            logs.append("ШАГ 1: Предобработка изображения...")
+            processed_path = preprocess_image(file_path) if file_path.lower().endswith(
+                ('.png', '.jpg', '.jpeg')) else file_path
+            logs.append("Предобработка завершена")
+
+            logs.append("ШАГ 2: Распознавание текста (OCR)...")
+            ocr_data = self.ocr.extract(processed_path if processed_path else file_path)
+
+            full_ocr_text = "\n\n--- РАЗРЫВ СТРАНИЦЫ ---\n\n".join(
+                page['text'] for page in ocr_data['pages']
+            )
+
+            logs.append(f"OCR завершён. Символов: {len(full_ocr_text)}")
+            logs.append(f"OCR движок: {ocr_data['ocr_engine']}")
+            logs.append(f"Страниц: {len(ocr_data['pages'])}")
+
+            logs.append("ШАГ 3: Нормализация текста (даты, валюты)...")
+            normalized_text = normalize_data(full_ocr_text)
+
+            translated_text = normalized_text
+            if self.translator:
+                logs.append("ШАГ 4: Перевод на русский...")
+                translated_text = self.translator(normalized_text)
+                logs.append("Перевод выполнен")
+            else:
+                logs.append("ШАГ 4: Перевод отключён")
+
+            original_pages_text = [page['text'] for page in ocr_data['pages']]
+            for i, page in enumerate(ocr_data['pages']):
+                if self.translator:
+                    page['text'] = self.translator(page['text'])
+                else:
+                    page['text'] = normalize_data(page['text'])
+
+            logs.append("ШАГ 5: LLM интерпретация (извлечение полей)...")
+            parsed_list = self.llm.interpret_multi(ocr_data)
+            logs.append(f"Извлечено записей: {len(parsed_list)}")
+
+            if not parsed_list:
+                raise ValueError("Не удалось извлечь данные из документа")
+
+            for i, page in enumerate(ocr_data['pages']):
+                page['text'] = original_pages_text[i]
+
+            logs.append("ШАГ 6: Классификация и валидация...")
+            enriched_parsed_list = []
+            for idx, parsed in enumerate(parsed_list):
+                data_for_classifier = {
+                    "merchant": parsed.get('company', ''),
+                    "items": [],
+                    "total": parsed.get('total', 0),
+                    "currency": parsed.get('currency', 'RUB'),
+                    "date": parsed.get('date', '')
+                }
+                category_result = self.classifier.classify(data_for_classifier)
+
+                if config['app'].get('enable_validation', True):
+                    total_value = 0.0
+                    if parsed.get('total'):
+                        try:
+                            total_str = str(parsed.get('total')).replace(',', '.')
+                            numbers = re.findall(r'[\d\.]+', total_str)
+                            if numbers:
+                                total_value = float(numbers[0])
+                        except:
+                            total_value = 0.0
+
+                    date_value = parsed.get('date', '') or ''
+                    currency_value = parsed.get('currency', 'RUB') or 'RUB'
+
+                    validation_data = {
+                        "items": [],
+                        "total": total_value,
+                        "currency": currency_value,
+                        "date": date_value
+                    }
+                    validation = self.validator.validate(validation_data)
+                else:
+                    validation = {"valid": True, "errors": []}
+
+                enriched = parsed.copy()
+                enriched['category'] = category_result.get('category', 'прочее')
+                enriched['validation_valid'] = validation['valid']
+                if validation.get('errors'):
+                    enriched['validation_errors'] = validation['errors']
+                enriched_parsed_list.append(enriched)
+
+                logs.append(
+                    f"  Запись {idx + 1}: категория={enriched['category']}, валидация={'ПРОЙДЕНА' if validation['valid'] else 'НЕ ПРОЙДЕНА'}")
+
+            logs.append("ШАГ 7: Сохранение в базу данных...")
+            ocr_version = ocr_data['ocr_engine']
+            llm_version = config['llm'].get('version', config['llm']['model'])
+
+            doc_id = self.db.save(
+                filename=filename,
+                ocr_text=full_ocr_text,
+                parsed_data=enriched_parsed_list,
+                ocr_version=ocr_version,
+                llm_version=llm_version
+            )
+
+            self.db.log_event(doc_id, "OCR_COMPLETE", f"Engine: {ocr_version}")
+            self.db.log_event(doc_id, "LLM_PARSE", f"Извлечено {len(parsed_list)} записей")
+            self.db.log_event(doc_id, "MULTI_PAGE", f"Документ содержит {len(parsed_list)} страниц/счетов")
+
+            for log_msg in logs:
+                self.db.log_event(doc_id, "ОРКЕСТРАТОР", log_msg)
+
+            logs.append(f"Сохранено в БД с ID: {doc_id}")
+            logs.append("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО")
+
+            return {
+                "doc_id": doc_id,
+                "filename": filename,
+                "parsed_list": enriched_parsed_list,
+                "logs": logs,
+                "ocr_text_preview": full_ocr_text[:500]
+            }
+
+        except Exception as e:
+            error_msg = f"КРИТИЧЕСКАЯ ОШИБКА: {str(e)}"
+            logs.append(error_msg)
+            logging.error(error_msg)
+
+            if doc_id:
+                self.db.log_event(doc_id, "ОШИБКА", error_msg)
+
+            return {
+                "doc_id": None,
+                "filename": filename,
+                "error": str(e),
+                "logs": logs,
+                "parsed_list": []
+            }
+
+=== FILE: ./main.py ===
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from gui.gui import App
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
+
+=== FILE: ./ocr/ocr_module.py ===
+import cv2
+import numpy as np
+import pytesseract
+from pdf2image import convert_from_path
+from datetime import datetime
+import yaml
+
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+class OCRModule:
+    def preprocess(self, img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.convertScaleAbs(gray, alpha=config['ocr']['preprocessing']['alpha'], beta=0)
+        thresh = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            config['ocr']['preprocessing']['adaptive_block_size'],
+            config['ocr']['preprocessing']['adaptive_constant']
+        )
+        return thresh
+
+    def extract(self, file_path):
+        all_pages = []
+        lang = config['ocr']['lang']
+
+        if file_path.lower().endswith(".pdf"):
+            images = convert_from_path(file_path)
+            for page_num, img in enumerate(images):
+                img_np = np.array(img)
+                processed = self.preprocess(img_np)
+                data = pytesseract.image_to_data(processed, lang=lang, output_type=pytesseract.Output.DICT)
+                text = pytesseract.image_to_string(processed, lang=lang)
+                blocks = []
+                for i in range(len(data['text'])):
+                    txt = data['text'][i].strip()
+                    if txt:
+                        conf = int(data['conf'][i]) if data['conf'][i] != -1 else 0
+                        blocks.append({
+                            "text": txt,
+                            "left": int(data['left'][i]),
+                            "top": int(data['top'][i]),
+                            "width": int(data['width'][i]),
+                            "height": int(data['height'][i]),
+                            "confidence": conf
+                        })
+                all_pages.append({
+                    "page": page_num + 1,
+                    "text": text,
+                    "blocks": blocks
+                })
+        else:
+            img = cv2.imread(file_path)
+            if img is None:
+                raise ValueError(f"Could not read image file: {file_path}")
+            processed = self.preprocess(img)
+            data = pytesseract.image_to_data(processed, lang=lang, output_type=pytesseract.Output.DICT)
+            text = pytesseract.image_to_string(processed, lang=lang)
+            blocks = []
+            for i in range(len(data['text'])):
+                txt = data['text'][i].strip()
+                if txt:
+                    conf = int(data['conf'][i]) if data['conf'][i] != -1 else 0
+                    blocks.append({
+                        "text": txt,
+                        "left": int(data['left'][i]),
+                        "top": int(data['top'][i]),
+                        "width": int(data['width'][i]),
+                        "height": int(data['height'][i]),
+                        "confidence": conf
+                    })
+            all_pages.append({
+                "page": 1,
+                "text": text,
+                "blocks": blocks
+            })
+
+        return {
+            "pages": all_pages,
+            "timestamp": datetime.now().isoformat(),
+            "ocr_engine": f"Tesseract {pytesseract.get_tesseract_version()}"
+        }
+
+=== FILE: ./db/db_module.py ===
+import sqlite3
+import json
+from datetime import datetime
+
+class DatabaseModule:
+    def __init__(self, db_file="documents.db"):
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+        self.create_tables()
+
+    def create_tables(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                filename TEXT,
+                ocr_text TEXT,
+                data TEXT,
+                created_at TEXT,
+                ocr_version TEXT,
+                llm_version TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id INTEGER,
+                event TEXT,
+                details TEXT,
+                timestamp TEXT,
+                FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE SET NULL
+            )
+        """)
+        self.conn.commit()
+
+    def save(self, filename, ocr_text, parsed_data, ocr_version, llm_version):
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO documents (filename, ocr_text, data, created_at, ocr_version, llm_version)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (filename, ocr_text, json.dumps(parsed_data, ensure_ascii=False, indent=2),
+              datetime.now().isoformat(), ocr_version, llm_version))
+        self.conn.commit()
+        return cur.lastrowid
+
+    def log_event(self, doc_id, event, details=""):
+        cur = self.conn.cursor()
+        cur.execute("""
+            INSERT INTO logs (doc_id, event, details, timestamp)
+            VALUES (?, ?, ?, ?)
+        """, (doc_id, event, details, datetime.now().isoformat()))
+        self.conn.commit()
+
+    def get_all(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, filename, created_at FROM documents ORDER BY id DESC")
+        return cur.fetchall()
+
+    def get_one(self, doc_id):
+        cur = self.conn.cursor()
+        cur.execute("SELECT ocr_text, data FROM documents WHERE id=?", (doc_id,))
+        row = cur.fetchone()
+        if row:
+            return row[0], json.loads(row[1])
+        return None
+
+    def delete(self, doc_id):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+        cur.execute("DELETE FROM logs WHERE doc_id=?", (doc_id,))
+        self.conn.commit()
+
+    def get_logs(self, doc_id):
+        cur = self.conn.cursor()
+        cur.execute("SELECT event, details, timestamp FROM logs WHERE doc_id=? ORDER BY timestamp", (doc_id,))
+        return cur.fetchall()
+
+    def update_document(self, doc_id, updated_data):
+        cur = self.conn.cursor()
+        cur.execute("SELECT data FROM documents WHERE id=?", (doc_id,))
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Document {doc_id} not found")
+        current_data = json.loads(row[0])
+        current_data.update(updated_data)
+        cur.execute("UPDATE documents SET data=? WHERE id=?",
+                    (json.dumps(current_data, ensure_ascii=False, indent=2), doc_id))
+        self.conn.commit()
+
+

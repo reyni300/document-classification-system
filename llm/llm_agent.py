@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import re
 import yaml
 import ollama
@@ -14,6 +15,76 @@ def clean_json_trailing_commas(json_str):
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
     return json_str
+
+
+# Сколько всего попыток обращения к модели и пауза между ними.
+LLM_MAX_ATTEMPTS = 2
+LLM_RETRY_DELAY_SEC = 5
+
+
+def salvage_truncated_json(text):
+    """
+    Чинит ОБОРВАННЫЙ JSON от модели.
+
+    Мистраль иногда не дописывает ответ до конца — обрывается прямо посреди
+    значения ('"vat": nul'). Раньше такой ответ целиком уходил в мусор, хотя
+    первые поля в нём уже корректные. Отрезаем по последней запятой верхнего
+    уровня (то есть по последней ПОЛНОСТЬЮ записанной паре) и закрываем скобки.
+
+    Возвращает строку JSON или None, если спасать нечего.
+    """
+    start = text.find('{')
+    if start == -1:
+        return None
+
+    stack, cut, in_string, escaped = [], None, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in '{[':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]':
+            if stack:
+                stack.pop()
+        elif ch == ',' and len(stack) == 1:
+            cut = i
+
+    if cut is None or not stack:
+        return None
+    return text[start:cut] + ''.join(reversed(stack))
+
+
+def _is_out_of_memory_error(err):
+    """
+    Процесс модели снят из-за нехватки памяти. Ollama отдаёт это как 500 с
+    текстом "llama-server process has terminated: signal: killed".
+    """
+    text = str(err).lower()
+    return ('signal: killed' in text
+            or 'out of memory' in text
+            or 'cannot allocate memory' in text
+            or 'oom' in text)
+
+
+def _is_transient_llm_error(err):
+    """Ошибка, после которой имеет смысл повторить запрос."""
+    text = str(err).lower()
+    return (_is_out_of_memory_error(err)
+            or 'terminated' in text
+            or 'status code: 500' in text
+            or 'connection' in text
+            or 'timeout' in text
+            or 'timed out' in text)
 
 
 class InvoiceData(BaseModel):
@@ -155,6 +226,19 @@ class LLMAgent:
     def __init__(self):
         self._last_ocr_hash = None
         self._last_result = None
+        # Причины, по которым не удалось разобрать ответ модели. Нужны, чтобы
+        # наверх ушла КОНКРЕТНАЯ ошибка, а не общее "Не удалось извлечь данные
+        # из документа": у этого сообщения четыре разные причины (Ollama
+        # недоступна, ответ без JSON, сломанный JSON, непрошедшая валидация),
+        # и раньше они попадали только в консоль сервера.
+        self._last_errors = []
+
+    def _fail(self, reason, page_num):
+        """Запоминает причину и логирует её."""
+        message = f"стр. {page_num}: {reason}"
+        self._last_errors.append(message)
+        logging.error(message)
+        return None
 
     def _get_ocr_hash(self, ocr_json):
         import hashlib
@@ -171,6 +255,7 @@ class LLMAgent:
             return self._last_result
 
         print(f"DEBUG interpret_multi: {num_pages} страниц")
+        self._last_errors = []
 
         if num_pages == 0:
             return []
@@ -205,6 +290,15 @@ class LLMAgent:
 
             final_result = all_results
 
+        # Пустой результат всё равно приведёт к исключению в оркестраторе
+        # ("Не удалось извлечь данные из документа"), но по нему невозможно
+        # понять, что именно сломалось. Бросаем сами — с конкретной причиной,
+        # которая дойдёт до интерфейса.
+        if not final_result:
+            detail = '; '.join(self._last_errors) if self._last_errors else \
+                     'модель не вернула ни одной записи'
+            raise RuntimeError(f"LLM не вернул данные ({detail})")
+
         self._last_ocr_hash = current_hash
         self._last_result = final_result
         print(f"DEBUG: Извлечено {len(final_result)} записей из {num_pages} страниц")
@@ -223,13 +317,21 @@ class LLMAgent:
 - currency: код валюты — ТОЛЬКО одно из: RUB, USD, EUR, BYN
 - invoice_number: номер чека, счёта, квитанции
 - company: название организации, магазина или получателя платежа
-- vat: сумма НДС строкой, если есть, иначе null
-- document_type: тип документа одним словом или коротко, например: "Кассовый чек", "Банковская квитанция", "Счёт-фактура", "Товарный чек", "Платёжное поручение"
+- vat: сумма именно НДС (налога на добавленную стоимость) строкой, если есть, иначе null. Это ОТДЕЛЬНЫЙ конкретный налог — не путай его с другими налогами и платежами (например, "налог на прибыль", "налог на доходы организаций"). Если в документе есть другой налог, но НДС не упомянут — оставляй vat: null и НЕ подставляй сюда другой налог.
+- document_type: тип документа одним словом или коротко, например: "Кассовый чек", "Банковская квитанция", "Счёт-фактура", "Товарный чек", "Платёжное поручение", "Отчёт о финансовых результатах"
 
 Дополнительное поле extra_fields — словарь с ЛЮБЫМИ важными данными которые ты нашёл в документе.
-Включай в extra_fields всё значимое: плательщик, получатель, банк, назначение платежа, номер карты, номер телефона, адрес, артикулы товаров, количество позиций, скидка, бонусы, кассир, терминал, номер ЕРИП, код авторизации и т.д.
-НЕ включай в extra_fields то что уже есть в основных полях (date, total, currency, invoice_number, company, vat).
+ГЛАВНОЕ ПРАВИЛО: пройди документ сверху донизу и вынеси в extra_fields КАЖДУЮ строку вида "Название: значение" и КАЖДУЮ строку таблицы — все до одной, не пропуская ни первую, ни последнюю. Плательщик, получатель, банк, назначение платежа, номер карты, адрес, кассир, терминал, номер ЕРИП, код авторизации, RRN, комиссия, сумма операции, показатели отчётности — всё.
+Не дублируй в extra_fields основные поля (date, total, currency, invoice_number, company, vat) — КРОМЕ строк таблицы и строк вида "Название: значение": их выписывай ВСЕГДА, даже если такое же число уже попало в total.
 Если дополнительных данных нет — extra_fields: {{}}.
+
+ТАБЛИЦЫ со столбцами за разные периоды (например "За 2025 г." и "За 2024 г." рядом для каждого показателя):
+- Каждый показатель дай ДВУМЯ отдельными ключами, по одному на период, с годом в названии: "Выручка (2025)" и "Выручка (2024)". Оба периода обязательны, ни один не отбрасывай.
+- Никогда не склеивай числа разных периодов в одно значение: два числа подряд у одного показателя — это два разных периода.
+- В основные поля (date, total, currency) бери значение только за первый/текущий период.
+
+ПОДПИСЬ в конце документа (пара строк "(подпись)" и "(расшифровка подписи)"):
+- Бери ТОЛЬКО расшифровку подписи — напечатанное ФИО целиком, например "Потапов С.Д.". Не бери саму подпись и символы линии ("___", тире). Не дублируй фамилию перед расшифровкой.
 
 Примеры:
 
@@ -239,22 +341,61 @@ class LLMAgent:
 Текст: "Приорбанк. Вывоз мусора. Плательщик: Иван Иванов. Сумма 258 BYN. Получатель: Датком Столица. Номер ЕРИП: 7788888. Код авторизации: 542121"
 Вывод: {{"date":null,"total":"258.00","currency":"BYN","invoice_number":null,"company":"Датком Столица","vat":null,"document_type":"Банковская квитанция","extra_fields":{{"Плательщик":"Иван Иванов","Банк":"Приорбанк","Услуга":"Вывоз мусора","Номер ЕРИП":"7788888","Код авторизации":"542121"}}}}
 
+Текст: "Отчёт о финансовых результатах за год 2025 г. Организация ООО Кристалл. Единица измерения: тыс. руб. Выручка За 2025 г. 15900 За 2024 г. 13200. Налог на прибыль (доходы) организаций (954) (792). Чистая прибыль (убыток) 726 За 2024 г. 598. Генеральный директор Потапов Потапов С.Д. 01 марта 2026 г."
+Вывод: {{"date":"01.03.2026","total":"726","currency":"RUB","invoice_number":null,"company":"ООО Кристалл","vat":null,"document_type":"Отчёт о финансовых результатах","extra_fields":{{"Единица измерения":"тыс. руб.","Выручка (2025)":"15900","Выручка (2024)":"13200","Налог на прибыль (доходы) организаций (2025)":"954","Налог на прибыль (доходы) организаций (2024)":"792","Чистая прибыль (убыток) (2025)":"726","Чистая прибыль (убыток) (2024)":"598","Генеральный директор":"Потапов С.Д."}}}}
+
 Теперь извлеки из следующего текста (страница {page_num}):
 
 {full_text}
 
+Напоминание перед ответом:
+1) в extra_fields должна попасть КАЖДАЯ строка "Название: значение" и КАЖДАЯ строка таблицы, включая самую первую и самую последнюю;
+2) если у показателя два периода — два отдельных ключа с годом, оба;
+3) только JSON, без пояснений.
+
 Вывод (только JSON):
 """
 
-        try:
-            response = ollama.chat(
-                model=config['llm']['model'],
-                messages=[{'role': 'user', 'content': prompt}],
-                options={'temperature': config['llm']['temperature']}
-            )
-        except Exception as e:
-            logging.error(f"Ollama error on page {page_num}: {e}")
-            return None
+        # Частая беда на машине с небольшим объёмом памяти: ядро убивает
+        # llama-server (OOM killer), и Ollama отвечает 500 с текстом вида
+        # "llama-server process has terminated: signal: killed". Сам процесс
+        # при следующем обращении поднимается заново, поэтому одну повторную
+        # попытку делаем сами — иначе обработка документа падает целиком
+        # из-за разовой нехватки памяти.
+        response = None
+        for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+            try:
+                response = ollama.chat(
+                    model=config['llm']['model'],
+                    messages=[{'role': 'user', 'content': prompt}],
+                    # format='json' заставляет Ollama декодировать ответ по
+                    # грамматике JSON — модель физически не может выдать текст
+                    # вокруг объекта или оборвать структуру. Это убирает два из
+                    # четырёх видов отказа ("в ответе нет JSON" и "не удалось
+                    # разобрать JSON"). В llm_client.py для классификатора то же
+                    # самое стоит с самого начала.
+                    format='json',
+                    options={'temperature': config['llm']['temperature']}
+                )
+                break
+            except Exception as e:
+                if attempt < LLM_MAX_ATTEMPTS and _is_transient_llm_error(e):
+                    logging.warning(
+                        f"стр. {page_num}: попытка {attempt} не удалась ({e}). "
+                        f"Повтор через {LLM_RETRY_DELAY_SEC} c."
+                    )
+                    time.sleep(LLM_RETRY_DELAY_SEC)
+                    continue
+                hint = ''
+                if _is_out_of_memory_error(e):
+                    hint = (' — похоже, процессу модели не хватило оперативной памяти '
+                            '(его снял OOM killer). Освободите память или возьмите '
+                            'модель полегче.')
+                return self._fail(
+                    f"Ollama недоступна или вернула ошибку: {e}{hint}", page_num)
+
+        if response is None:
+            return self._fail("Ollama не вернула ответ", page_num)
 
         content = response['message']['content']
         print(f"[LLM RAW OUTPUT page {page_num}]: {content[:200]}...")
@@ -262,8 +403,9 @@ class LLMAgent:
         first_brace = content.find('{')
         last_brace = content.rfind('}')
         if first_brace == -1 or last_brace == -1:
-            logging.error(f"No JSON found on page {page_num}")
-            return None
+            return self._fail(
+                f"в ответе модели нет JSON (получено {len(content)} симв.: "
+                f"{content[:120]!r})", page_num)
 
         json_str = content[first_brace:last_brace + 1]
         json_str = clean_json_trailing_commas(json_str)
@@ -292,8 +434,15 @@ class LLMAgent:
             if objects:
                 data = objects[0]
             else:
-                logging.error(f"Could not parse JSON on page {page_num}")
-                return None
+                # последняя попытка: ответ мог просто оборваться на середине
+                repaired = salvage_truncated_json(content)
+                try:
+                    data = json.loads(clean_json_trailing_commas(repaired or ''))
+                    print(f"[LLM] ответ был оборван, спасено полей: {len(data)}")
+                except (json.JSONDecodeError, TypeError):
+                    return self._fail(
+                        f"не удалось разобрать JSON из ответа модели "
+                        f"({json_str[:120]!r})", page_num)
 
         try:
             validated = InvoiceData(**data)
@@ -328,8 +477,7 @@ class LLMAgent:
             return result
 
         except Exception as e:
-            logging.error(f"Validation error on page {page_num}: {e}")
-            return None
+            return self._fail(f"данные не прошли валидацию: {e}", page_num)
 
     def interpret(self, ocr_json):
         result = self.interpret_multi(ocr_json)

@@ -1,3 +1,7 @@
+import json
+import re
+
+
 class ClassificationAgent:
     ALLOWED_CATEGORIES = {
         "еда",
@@ -324,7 +328,32 @@ class ClassificationAgent:
         if isinstance(response, dict):
             raw_category = str(response.get("category", "")).strip()
         elif isinstance(response, str):
-            raw_category = response.strip()
+            # Промпт явно просит модель вернуть ЈSON-строку {"category": "..."}.
+            # Большинство простых LLM-клиентов отдают именно сырой текст ответа,
+            # а не уже распарсенный dict — раньше эта ветка брала всю строку
+            # '{"category": "продукты"}' целиком как "название категории",
+            # она никогда не совпадала ни с одним алиасом/категорией, и на выходе
+            # ВСЕГДА получалось "прочее", каким бы ни был реальный ответ модели.
+            text = response.strip()
+            parsed = None
+            try:
+                parsed = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                # Модель могла обернуть JSON в ```json ... ``` или добавить текст вокруг —
+                # вытаскиваем первый {...} блок и пробуем распарсить отдельно
+                match = re.search(r'\{.*\}', text, re.DOTALL)
+                if match:
+                    try:
+                        parsed = json.loads(match.group(0))
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = None
+
+            if isinstance(parsed, dict):
+                raw_category = str(parsed.get("category", "")).strip()
+            else:
+                # JSON не нашли — возможно, модель проигнорировала формат
+                # и вернула голое имя категории ("продукты") — тоже валидно
+                raw_category = text
         else:
             raw_category = str(response).strip()
 

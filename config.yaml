@@ -1,5 +1,14 @@
 ocr:
   lang: "rus+eng"
+  pdf_dpi: 300
+  # Страница распознаётся несколькими способами, из них берётся тот, где больше
+  # уверенно прочитанных слов. Дороже по времени (примерно втрое), но одного
+  # режима, хорошего для всех документов, не существует: на чистом бланке
+  # выигрывает один, на плотной таблице в рамках — другой.
+  auto_mode: false
+  # Действуют, только когда auto_mode: false
+  psm: 3
+  remove_table_lines: false
   preprocessing:
     alpha: 1.5
     adaptive_block_size: 11
@@ -7,7 +16,7 @@ ocr:
 
 llm:
   model: "mistral"
-  temperature: 0.1
+  temperature: 0
   version: "mistral:latest"
 
 database:

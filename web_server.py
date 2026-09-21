@@ -21,6 +21,7 @@ from agents.classification_agent import ClassificationAgent
 from agents.validation_agent import ValidationAgent
 from llm.llm_client import LLMClient
 from translation.translator import translate_field
+import rule_fields
 import yaml
 
 with open("config.yaml", "r", encoding="utf-8") as f:
@@ -51,19 +52,161 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
+_NUMBER_TOKEN_RE = re.compile(r'^(\d+)[.,](\d+)$')
+
+
+def _canon_number_token(token):
+    """
+    "1.20" -> "1.2", "17.00" -> "17", "18.20" -> "18.2".
+
+    Валидаторы в llm_agent.py приводят денежные значения к двум знакам после
+    запятой (normalize_total / normalize_vat), а в документе напечатано как
+    есть: "17", "1.2". Дописанные нули ломали сопоставление: нормализация
+    выбрасывает точку, и "1.20 BYN" превращалось в "120byn", что уже НЕ
+    является подстрокой напечатанного "12byn" — значение не находилось нигде.
+    Именно так пропадали "Сумма" и "Комиссия" на чеке Альфа-Банка.
+
+    Обрезаем только хвостовые нули дробной части и только у токена, который
+    целиком является числом: дату "01.03.2026" трогать нельзя (там два
+    разделителя, полное совпадение не сработает, и токен остаётся как был).
+    """
+    m = _NUMBER_TOKEN_RE.match(token)
+    if not m:
+        return token
+    frac = m.group(2).rstrip('0')
+    return m.group(1) + ('.' + frac if frac else '')
+
+
 def normalize_for_search(text):
     """Нормализует строку для нечёткого сравнения."""
     if not text:
         return ''
     text = str(text).lower().strip()
+    text = ' '.join(_canon_number_token(tok) for tok in text.split())
     text = re.sub(r'[^\w\d]', '', text)
     return text
+
+
+def blocks_in_reading_order(blocks):
+    """
+    Раскладывает OCR-блоки в порядке чтения: сначала собирает их в строки по
+    вертикальному перекрытию, затем внутри каждой строки сортирует слева
+    направо. Нужно для поиска ФРАЗЫ по подряд идущим блокам: Tesseract отдаёт
+    отдельный блок на каждое слово, и "Дебетовая карта (**** 0000)" — это
+    четыре соседних блока одной строки, а не один.
+    """
+    items = [b for b in blocks if str(b.get('text', '')).strip()]
+    if not items:
+        return []
+
+    lines = []
+    for b in sorted(items, key=lambda x: (x.get('top', 0), x.get('left', 0))):
+        top = b.get('top', 0)
+        bottom = top + b.get('height', 0)
+        placed = False
+        for line in lines:
+            l_top = min(x.get('top', 0) for x in line)
+            l_bottom = max(x.get('top', 0) + x.get('height', 0) for x in line)
+            overlap = min(bottom, l_bottom) - max(top, l_top)
+            shortest = min(bottom - top, l_bottom - l_top) or 1
+            if overlap > 0.4 * shortest:
+                line.append(b)
+                placed = True
+                break
+        if not placed:
+            lines.append([b])
+
+    lines.sort(key=lambda line: min(x.get('top', 0) for x in line))
+    ordered = []
+    for line in lines:
+        ordered.extend(sorted(line, key=lambda b: b.get('left', 0)))
+    return ordered
+
+
+def _window_score(window_text, norm_value, fragment_counts=None):
+    """
+    Насколько склейка подряд идущих блоков соответствует значению.
+    1.0 — точное совпадение; меньше — если в окне есть лишнее или, наоборот,
+    покрыта только часть значения. 0 — не годится.
+    """
+    if not window_text:
+        return 0.0
+    if window_text == norm_value:
+        return 1.0
+    if norm_value in window_text:
+        # Если значение — число, оно должно совпасть с ЦЕЛЫМ числом в окне, а
+        # не с куском более длинного: "6726" внутри "672600" — это другое
+        # число. На чеке Альфа-Банка из-за этого значение "6726.00" садилось на
+        # блок кода авторизации "672600". Проверяем именно по числам в окне, а
+        # не по строке целиком: иначе ограничение обходится соседним текстовым
+        # блоком ("6174860" совпадало с окном "RRN" + "617486005488").
+        if norm_value.isdigit():
+            if norm_value not in re.findall(r'\d+', window_text):
+                return 0.0
+        # Значение целиком внутри окна, но есть лишние символы — чем их
+        # меньше, тем лучше.
+        return len(norm_value) / len(window_text)
+    if window_text in norm_value:
+        # Окно покрывает только ЧАСТЬ значения. Так бывает законно: дата
+        # "01.03.2026" в бланке разбита на "01", "марта", "20", "26", и целиком
+        # её последовательностью блоков не собрать.
+        value_has_digits = any(ch.isdigit() for ch in norm_value)
+        window_has_digits = any(ch.isdigit() for ch in window_text)
+
+        # У денежного значения опознавательный кусок — это ЧИСЛО, а не код
+        # валюты. На чеке Альфа-Банка "1.2 BYN" из строки "Комиссия" цеплялось
+        # за единственный распознанный "BYN" (он оказался на строке "Сумма") и
+        # вставало на чужую строку, подменяя собой сумму. Кусок без цифр не
+        # может опознать место, если в самом значении цифры есть.
+        if value_has_digits and not window_has_digits:
+            return 0.0
+
+        # Числовой кусок различает место и при двух символах: "1.2" из строки
+        # "Комиссия" нормализуется в "12", и раньше он отбрасывался порогом в
+        # три символа — притом что это был единственный ПРАВИЛЬНЫЙ якорь.
+        if len(window_text) < (2 if window_has_digits else 3):
+            return 0.0
+
+        # Число значения совпало ЦЕЛИКОМ, не хватает только обрамления — как
+        # правило кода валюты, который OCR распознаёт через раз. Это сильное
+        # совпадение: в "1.2 BYN" опознаёт место именно "1.2". По длине строки
+        # такой кусок набирал бы всего 2 символа из 5 и не дотягивал до порога.
+        if value_has_digits:
+            value_digits = ''.join(ch for ch in norm_value if ch.isdigit())
+            window_digits = ''.join(ch for ch in window_text if ch.isdigit())
+            if window_digits and window_digits == value_digits:
+                return 0.85
+
+        coverage = len(window_text) / len(norm_value)
+
+        # Кусок должен ещё и однозначно указывать на место в документе:
+        # фрагмент, встречающийся в документе много раз, сам по себе не
+        # доказывает ничего.
+        occurrences = (fragment_counts or {}).get(window_text, 1)
+        if occurrences > 1 and coverage < 0.75:
+            return 0.0
+
+        if coverage >= 0.35:
+            return 0.9 * coverage
+    return 0.0
 
 
 def find_blocks_for_value(blocks, value):
     """
     Ищет OCR-блоки, соответствующие извлечённому значению.
-    Возвращает список блоков с координатами.
+
+    Раньше блоки искались ПОШТУЧНО и независимо друг от друга, причём ветки
+    шли по очереди: если срабатывал поиск "по первому числу значения", то
+    словесная часть значения уже не проверялась вовсе. На реальном чеке это
+    давало съехавшие рамки: у значения "Дебетовая карта (**** 0000)" бралось
+    первое число "0000", и подсвечивались все блоки, где оно встречается, —
+    хвост "0000)" вместо всей фразы плюс лишняя рамка на совсем другой строке
+    с номером карточки "000000******0000".
+
+    Теперь ищем ПОСЛЕДОВАТЕЛЬНОСТЬ подряд идущих блоков (в порядке чтения),
+    склейка которых лучше всего совпадает со значением целиком. Значение,
+    встречающееся в документе несколько раз, даёт несколько одинаково хороших
+    последовательностей — возвращаем их все.
     """
     if not value or not blocks:
         return []
@@ -74,49 +217,89 @@ def find_blocks_for_value(blocks, value):
     if not norm_value or len(norm_value) < 2:
         return []
 
+    # Короткие значения (НДС "20", код валюты "BYN") — только ТОЧНОЕ совпадение,
+    # без частичных. Обнаружено на реальном OCR: "20" это подстрока "05092026"
+    # (год в дате), и без строгой проверки vat и date садились на один блок.
+    #
+    # Но совпасть может и НЕСКОЛЬКО подряд идущих блоков: на чеках Tesseract
+    # регулярно разбивает код валюты на "BY" + "N", и такая строка оставалась
+    # без подсветки. Требование точного равенства при этом сохраняется — окно
+    # принимается, только если склейка равна значению целиком.
+    if len(norm_value) <= 3:
+        ordered = blocks_in_reading_order(blocks)
+        norms = [normalize_for_search(b.get('text', '')) for b in ordered]
+        matched, used = [], set()
+        for i in range(len(ordered)):
+            if i in used or not norms[i]:
+                continue
+            acc = ''
+            for j in range(i, min(len(ordered), i + 4)):
+                acc += norms[j]
+                if len(acc) > len(norm_value):
+                    break
+                if acc == norm_value:
+                    matched.extend(ordered[i:j + 1])
+                    used.update(range(i, j + 1))
+                    break
+        return matched
+
+    ordered = blocks_in_reading_order(blocks)
+    if not ordered:
+        return []
+
+    norms = [normalize_for_search(b.get('text', '')) for b in ordered]
+    n = len(ordered)
+    MAX_BLOCKS_IN_WINDOW = 14
+
+    # Первый проход: перебираем окна и считаем, в скольких РАЗНЫХ местах
+    # документа встречается одна и та же склейка текста. Это нужно, чтобы
+    # отличить надёжный кусок значения от расхожего фрагмента вроде "BYN"
+    # (см. _window_score).
+    windows = []  # (start, end, acc)
+    fragment_counts = {}
+    for i in range(n):
+        if not norms[i]:
+            continue
+        acc = ''
+        for j in range(i, min(n, i + MAX_BLOCKS_IN_WINDOW)):
+            # Блоки из одной пунктуации ("(****", ":", "—") нормализуются в
+            # пустую строку. Такой блок не разрывает фразу — он её часть:
+            # в "Дебетовая карта (**** 0000)" между "карта" и "0000)" стоит
+            # именно он, и если на нём останавливаться, рамка обрывается на
+            # середине фразы.
+            acc += norms[j]
+            if len(acc) > len(norm_value) + 12:
+                break  # окно уже заведомо длиннее значения — дальше только хуже
+            if acc:
+                windows.append((i, j, acc))
+                fragment_counts[acc] = fragment_counts.get(acc, 0) + 1
+
+    # Второй проход: оцениваем окна, уже зная, какие фрагменты неоднозначны.
+    candidates = []  # (score, start, end)
+    for i, j, acc in windows:
+        score = _window_score(acc, norm_value, fragment_counts)
+        if score > 0:
+            candidates.append((score, i, j))
+
+    if not candidates:
+        return []
+
+    # Лучший счёт задаёт планку; при равном счёте предпочитаем более короткое
+    # окно (меньше лишних блоков в рамке).
+    candidates.sort(key=lambda c: (-c[0], c[2] - c[1]))
+    top_score = candidates[0][0]
+    if top_score < 0.4:
+        return []
+
     matched = []
-
-    # 1. Точное совпадение нормализованного текста блока
-    for block in blocks:
-        norm_block = normalize_for_search(block.get('text', ''))
-        if norm_block and norm_value in norm_block:
-            matched.append(block)
-
-    if matched:
-        return matched
-
-    # 2. Поиск по числам — для сумм, дат, номеров
-    value_parts = re.findall(r'\d+', norm_value)
-    if value_parts:
-        main_number = value_parts[0]
-        if len(main_number) >= 3:
-            for block in blocks:
-                norm_block = normalize_for_search(block.get('text', ''))
-                if main_number in norm_block:
-                    matched.append(block)
-
-    if matched:
-        return matched
-
-    # 3. Поиск по значимым словам (для компаний типа "ЗАО Альфа-Банк")
-    # Разбиваем значение на слова длиной 3+ символа и ищем блоки содержащие хотя бы одно
-    words = [w for w in re.findall(r'[а-яёa-z0-9]+', norm_value) if len(w) >= 3]
-    if words:
-        for block in blocks:
-            norm_block = normalize_for_search(block.get('text', ''))
-            if norm_block and any(w in norm_block for w in words):
-                matched.append(block)
-
-    if matched:
-        return matched
-
-    # 4. Поиск по префиксу
-    if len(norm_value) >= 4:
-        prefix = norm_value[:4]
-        for block in blocks:
-            norm_block = normalize_for_search(block.get('text', ''))
-            if norm_block and prefix in norm_block:
-                matched.append(block)
+    used = set()
+    for score, i, j in candidates:
+        if score < top_score - 1e-9:
+            break  # берём только все РАВНО ЛУЧШИЕ вхождения значения
+        if any(k in used for k in range(i, j + 1)):
+            continue  # пересекается с уже выбранным вхождением
+        matched.extend(ordered[i:j + 1])
+        used.update(range(i, j + 1))
 
     return matched
 
@@ -184,23 +367,21 @@ def process_document():
         llm_agent._last_ocr_hash = None
         llm_agent._last_result = None
 
-        # Получаем OCR-блоки ДО оркестратора, пока файл точно на диске
-        try:
-            ocr_data_for_mapping = ocr.extract(tmp_path)
-            pages_blocks = [page.get('blocks', []) for page in ocr_data_for_mapping.get('pages', [])]
-        except Exception as e:
-            print(f"DEBUG OCR mapping error: {e}")
-            import traceback
-            traceback.print_exc()
-            pages_blocks = []
-
-        # Сбрасываем кэш снова — чтобы оркестратор запустил LLM заново,
-        # а не вернул кэш от вызова выше
-        llm_agent._last_ocr_hash = None
-        llm_agent._last_result = None
-
-        # Запускаем основную обработку
+        # Запускаем основную обработку.
+        # ВАЖНО: раньше здесь ДО оркестратора отдельно вызывался ocr.extract(tmp_path)
+        # только чтобы получить блоки под маппинг полей на фронте. Для картинок это
+        # было небезопасно: оркестратор внутри себя гоняет OCR по ДРУГОМУ варианту
+        # изображения (после preprocess_image — контраст/резкость/жёсткая бинаризация),
+        # а этот отдельный вызов — по оригиналу. Два прохода Tesseract по разным
+        # картинкам вполне могут распознать текст по-разному, и тогда
+        # build_field_mapping() не находил бы блок под значение, которое реально
+        # извлёк LLM (LLM ведь читал текст ИЗ ДРУГОГО прохода OCR). Плюс PDF гонялся
+        # через pdf2image+Tesseract дважды впустую.
+        # Теперь оркестратор сам отдаёт наверх ocr_pages — те же страницы/блоки,
+        # что видел LLM, — и мы строим маппинг по ним же. Один OCR-проход на файл.
         result = orchestrator.process_document(tmp_path, file.filename)
+        ocr_pages = result.get('ocr_pages', [])
+        pages_blocks = [page.get('blocks', []) for page in ocr_pages]
 
         # Строим маппинг для каждой записи в parsed_list
         parsed_list = result.get('parsed_list', [])
@@ -213,6 +394,9 @@ def process_document():
                      (pages_blocks[0] if pages_blocks else [])
 
             mapping = build_field_mapping(parsed_item, blocks)
+            added = rule_fields.merge_fields(parsed_item, blocks, mapping)
+            if added:
+                print(f'[rule_fields] стр. {page_idx + 1}: добавлено полей — {added}')
             field_mappings.append(mapping)
 
         # Добавляем блоки страниц, маппинг и PNG-урлы в результат
@@ -220,10 +404,8 @@ def process_document():
 
         # PNG-урлы для предпросмотра PDF-страниц
         png_urls = []
-        print(f"DEBUG PDF_PAGES_DIR={PDF_PAGES_DIR}")
-        for page in ocr_data_for_mapping.get('pages', []):
+        for page in ocr_pages:
             png_path = page.get('png_path', '')
-            print(f"DEBUG png_path={png_path}, starts={png_path.startswith(PDF_PAGES_DIR) if png_path else False}")
             if png_path and png_path.startswith(PDF_PAGES_DIR):
                 fname = os.path.basename(png_path)
                 png_urls.append(f'/api/page-image/{fname}')
@@ -231,7 +413,8 @@ def process_document():
                 png_urls.append(None)
         result['png_urls'] = png_urls
         result['field_mappings'] = field_mappings
-        
+        result.pop('ocr_pages', None)  # сырые блоки с полным текстом каждого слова фронту не нужны
+
         return jsonify(result)
 
     except Exception as e:

@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from preprocessing.preprocessor import preprocess_image
 from translation.translator import normalize_data
+import rule_fields
 
 import yaml
 
@@ -24,9 +25,34 @@ class Orchestrator:
         self.validator = validator
         self.translator = translator_func
 
+    def _parse_by_rules(self, ocr_data, logs):
+        """
+        Запасной разбор, когда LLM не ответила: поля берутся только правилами
+        по координатам OCR-блоков (rule_fields). Страницы, где правила ничего
+        не нашли, пропускаем.
+        """
+        pages = ocr_data.get('pages', []) if ocr_data else []
+        by_rules = []
+        for i, page in enumerate(pages):
+            item = {
+                '_page': i + 1,
+                'total': None, 'date': None, 'company': None,
+                'invoice_number': None, 'vat': None, 'currency': None,
+                'document_type': 'документ',
+                'extra_fields': {},
+                'extracted_by': 'rules',
+            }
+            found = rule_fields.merge_fields(item, page.get('blocks', []))
+            logs.append(f"  Стр. {i + 1}: правила нашли полей — {found}")
+            if found:
+                by_rules.append(item)
+        return by_rules
+
     def process_document(self, file_path, filename):
         logs = []
         doc_id = None
+        llm_failure = None
+        ocr_data = None  # используется и в ветке успеха, и в except — для отдачи блоков наверх
 
         try:
             logs.append(f"НАЧАЛО ОБРАБОТКИ: {filename}")
@@ -75,14 +101,30 @@ class Orchestrator:
                     page['text'] = normalize_data(text)
 
             logs.append("ШАГ 5: LLM интерпретация (извлечение полей)...")
-            parsed_list = self.llm.interpret_multi(ocr_data)
-            logs.append(f"Извлечено записей: {len(parsed_list)}")
+            # interpret_multi бросает RuntimeError, если модель не дала ничего.
+            # Раньше это была фатальная ошибка; теперь — повод включить правила.
+            try:
+                parsed_list = self.llm.interpret_multi(ocr_data)
+                logs.append(f"Извлечено записей: {len(parsed_list)}")
+            except Exception as llm_error:
+                llm_failure = str(llm_error)
+                logs.append(f"LLM не отработала: {llm_failure}")
+                parsed_list = []
 
             if not parsed_list:
-                raise ValueError("Не удалось извлечь данные из документа")
+                # Модель молчит или вернула мусор. Раньше здесь обработка
+                # обрывалась и пользователь не получал НИЧЕГО. Но поля по
+                # координатам OCR-блоков модель не нужна — собираем документ
+                # правилами и идём дальше.
+                logs.append("Модель данных не дала — пробуем собрать поля правилами...")
+                parsed_list = self._parse_by_rules(ocr_data, logs)
+                if not parsed_list:
+                    raise ValueError(llm_failure or "Не удалось извлечь данные из документа")
+                logs.append(f"Документ собран правилами, без модели: записей {len(parsed_list)}")
 
             for i, page in enumerate(ocr_data['pages']):
-                page['text'] = original_pages_text[i]
+                if i < len(original_pages_text):
+                    page['text'] = original_pages_text[i]
 
             logs.append("ШАГ 6: Классификация и валидация...")
             enriched_parsed_list = []
@@ -125,8 +167,18 @@ class Orchestrator:
                 enriched['validation_valid'] = validation['valid']
                 if validation.get('errors'):
                     enriched['validation_errors'] = validation['errors']
+                # Поля, которые модель не вернула, добираем правилами по координатам
+                # OCR-блоков. Делаем это ДО сохранения в БД, иначе в историю попал бы
+                # неполный набор полей, а на экране сразу после обработки — полный.
+                page_idx = parsed.get('_page', idx + 1) - 1
+                pages = ocr_data['pages']
+                page_blocks = (pages[page_idx] if 0 <= page_idx < len(pages)
+                               else (pages[0] if pages else {})).get('blocks', [])
+                by_rules = rule_fields.merge_fields(enriched, page_blocks)
+
                 enriched_parsed_list.append(enriched)
 
+                logs.append(f"  Запись {idx + 1}: полей по правилам={by_rules}")
                 logs.append(
                     f"  Запись {idx + 1}: категория={enriched['category']}, валидация={'ПРОЙДЕНА' if validation['valid'] else 'НЕ ПРОЙДЕНА'}")
 
@@ -157,7 +209,11 @@ class Orchestrator:
                 "filename": filename,
                 "parsed_list": enriched_parsed_list,
                 "logs": logs,
-                "ocr_text_preview": full_ocr_text[:500]
+                "ocr_text_preview": full_ocr_text[:500],
+                # Отдаём наверх те же самые страницы/блоки, на которых реально считал LLM —
+                # чтобы web_server.py строил маппинг полей по НИМ, а не гонял OCR второй раз
+                # по другому варианту изображения (см. комментарий в web_server.py)
+                "ocr_pages": ocr_data['pages'] if ocr_data else []
             }
 
         except Exception as e:
@@ -173,5 +229,6 @@ class Orchestrator:
                 "filename": filename,
                 "error": str(e),
                 "logs": logs,
-                "parsed_list": []
+                "parsed_list": [],
+                "ocr_pages": ocr_data['pages'] if ocr_data else []
             }
