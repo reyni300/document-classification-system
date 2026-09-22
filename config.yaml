@@ -7,8 +7,8 @@ ocr:
   # выигрывает один, на плотной таблице в рамках — другой.
   auto_mode: false
   # Действуют, только когда auto_mode: false
-  psm: 3
-  remove_table_lines: false
+  psm: 11
+  remove_table_lines: true
   preprocessing:
     alpha: 1.5
     adaptive_block_size: 11
