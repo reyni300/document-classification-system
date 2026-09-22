@@ -382,6 +382,7 @@ def process_document():
         result = orchestrator.process_document(tmp_path, file.filename)
         ocr_pages = result.get('ocr_pages', [])
         pages_blocks = [page.get('blocks', []) for page in ocr_pages]
+        pages_grid = [page.get('grid') for page in ocr_pages]
 
         # Строим маппинг для каждой записи в parsed_list
         parsed_list = result.get('parsed_list', [])
@@ -392,9 +393,11 @@ def process_document():
             page_idx = parsed_item.get('_page', idx + 1) - 1
             blocks = pages_blocks[page_idx] if page_idx < len(pages_blocks) else \
                      (pages_blocks[0] if pages_blocks else [])
+            grid = pages_grid[page_idx] if page_idx < len(pages_grid) else \
+                   (pages_grid[0] if pages_grid else None)
 
             mapping = build_field_mapping(parsed_item, blocks)
-            added = rule_fields.merge_fields(parsed_item, blocks, mapping)
+            added = rule_fields.merge_fields(parsed_item, blocks, mapping, grid=grid)
             if added:
                 print(f'[rule_fields] стр. {page_idx + 1}: добавлено полей — {added}')
             field_mappings.append(mapping)

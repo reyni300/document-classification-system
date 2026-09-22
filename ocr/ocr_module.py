@@ -52,6 +52,66 @@ class OCRModule:
         lines = cv2.dilate(lines, np.ones((2, 2), np.uint8))  # захватываем края штриха
         return 255 - cv2.subtract(inv, lines)
 
+    ЛЮФТ_ЛИНЕЙКИ = 12      # линейка уезжает вбок: лист сканирован с перекосом
+
+    @staticmethod
+    def _полосы(счёт, порог, слипание=6):
+        есть = np.where(счёт > порог)[0]
+        группы = []
+        for p in есть:
+            if группы and p - группы[-1][-1] <= слипание:
+                группы[-1].append(p)
+            else:
+                группы.append([p])
+        return [int((g[0] + g[-1]) / 2) for g in группы]
+
+    def table_grid(self, binary, мин_рядов=5, мин_граф=3):
+        """
+        Границы ячеек таблицы: {'rows': [y...], 'cols': [x...]} либо None.
+
+        Зачем: колонки бланка НАРИСОВАНЫ в документе, и до сих пор мы их
+        стирали, а потом угадывали заново по тому, как выровнялись числа.
+        Гадание разваливалось на каждом новом бланке: на второй странице
+        баланса оно нашло четыре колонки вместо трёх, одну выдуманную.
+
+        Ядра морфологии короткие: лист лежит с перекосом, сплошного штриха во
+        всю ширину или высоту на скане не бывает — длинное ядро не находит
+        вообще ничего. Отбираем по суммарной длине штрихов, не по
+        непрерывности.
+
+        Графу таблицы от рамки шапки документа отличаем по тому, в скольких
+        строках листа линейка вообще присутствует: настоящая графа идёт через
+        70-90% строк, разделитель шапки — через 15-20%.
+        """
+        inv = 255 - binary
+        h, w = binary.shape[:2]
+
+        гор = cv2.morphologyEx(inv, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (w // 12, 1)))
+        ряды = self._полосы((гор > 0).sum(axis=1), 0.15 * w)
+        if len(ряды) < мин_рядов + 1:
+            return None
+
+        вер = cv2.morphologyEx(inv, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40)))
+        люфт = self.ЛЮФТ_ЛИНЕЙКИ
+        графы = []
+        for x in self._полосы((вер > 0).sum(axis=0), 0.06 * h):
+            строк = 0
+            for верх, низ in zip(ряды, ряды[1:]):
+                высота = низ - верх
+                if высота < 10:
+                    continue
+                полоса = вер[верх:низ, max(0, x - люфт):x + люфт + 1]
+                if (полоса > 0).any(axis=1).sum() > 0.5 * высота:
+                    строк += 1
+            if строк > 0.5 * (len(ряды) - 1):
+                графы.append(x)
+
+        if len(графы) < мин_граф + 1:
+            return None
+        return {'rows': ряды, 'cols': графы}
+
     # Способы распознавания, из которых выбирается лучший. Ни один не годится
     # на все документы: на чистом бланке выигрывает разбор вёрстки самим
     # Tesseract (psm 3), на плотной таблице в рамках он же теряет почти всё,
@@ -102,9 +162,13 @@ class OCRModule:
         return sum(1 for b in blocks if b['confidence'] >= min_conf)
 
     def _recognize(self, img_np):
-        """Одна картинка -> (текст, блоки). Общий путь для PDF и изображений."""
+        """Одна картинка -> (текст, блоки, сетка). Общий путь для PDF и картинок."""
         ocr_cfg = config['ocr']
         binary = self.preprocess(img_np)
+        grid = self.table_grid(binary) if ocr_cfg.get('table_grid', True) else None
+        if grid:
+            print(f"[OCR] сетка таблицы: {len(grid['rows']) - 1} рядов, "
+                  f"{len(grid['cols']) - 1} граф")
 
         if not ocr_cfg.get('auto_mode', True):
             image = (self.remove_table_lines(binary)
@@ -146,7 +210,7 @@ class OCRModule:
         # Текст собираем из тех же блоков, что отдаём наверх, а не отдельным
         # вызовом image_to_string: раньше это были два независимых прохода
         # Tesseract, и LLM могла читать не то, что потом подсвечивалось.
-        return self._text_from_blocks(blocks), blocks
+        return self._text_from_blocks(blocks), blocks, grid
 
     @staticmethod
     def _text_from_blocks(blocks):
@@ -182,11 +246,12 @@ class OCRModule:
                 png_path = os.path.join(PDF_PAGES_DIR, f"{base_name}_page{page_num + 1}.png")
                 img_pil.save(png_path, "PNG")
 
-                text, blocks = self._recognize(np.array(img_pil))
+                text, blocks, grid = self._recognize(np.array(img_pil))
                 all_pages.append({
                     "page": page_num + 1,
                     "text": text,
                     "blocks": blocks,
+                    "grid": grid,
                     "png_path": png_path,          # путь к PNG для отдачи браузеру
                     "img_width": img_pil.width,    # реальные размеры PNG
                     "img_height": img_pil.height
@@ -196,11 +261,12 @@ class OCRModule:
             if img is None:
                 raise ValueError(f"Could not read image file: {file_path}")
             # cv2.imread отдаёт BGR, а preprocess ждёт RGB — переворачиваем каналы
-            text, blocks = self._recognize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            text, blocks, grid = self._recognize(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             all_pages.append({
                 "page": 1,
                 "text": text,
                 "blocks": blocks,
+                "grid": grid,
                 "png_path": file_path,
                 "img_width": img.shape[1],
                 "img_height": img.shape[0]

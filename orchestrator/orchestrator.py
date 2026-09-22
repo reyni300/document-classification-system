@@ -42,7 +42,8 @@ class Orchestrator:
                 'extra_fields': {},
                 'extracted_by': 'rules',
             }
-            found = rule_fields.merge_fields(item, page.get('blocks', []))
+            found = rule_fields.merge_fields(item, page.get('blocks', []),
+                                              grid=page.get('grid'))
             logs.append(f"  Стр. {i + 1}: правила нашли полей — {found}")
             if found:
                 by_rules.append(item)
@@ -172,9 +173,11 @@ class Orchestrator:
                 # неполный набор полей, а на экране сразу после обработки — полный.
                 page_idx = parsed.get('_page', idx + 1) - 1
                 pages = ocr_data['pages']
-                page_blocks = (pages[page_idx] if 0 <= page_idx < len(pages)
-                               else (pages[0] if pages else {})).get('blocks', [])
-                by_rules = rule_fields.merge_fields(enriched, page_blocks)
+                страница = (pages[page_idx] if 0 <= page_idx < len(pages)
+                            else (pages[0] if pages else {}))
+                page_blocks = страница.get('blocks', [])
+                by_rules = rule_fields.merge_fields(enriched, page_blocks,
+                                                    grid=страница.get('grid'))
 
                 enriched_parsed_list.append(enriched)
 
