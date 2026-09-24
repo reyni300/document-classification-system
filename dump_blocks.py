@@ -49,6 +49,25 @@ def main(path):
             ячейки = [rf._text(c) for c in rf.split_cells(line)]
             print('      ' + '  |  '.join(ячейки))
 
+        if grid:
+            проверки = rf.check_totals(blocks, grid)
+            if проверки:
+                плохих = [п for п in проверки if п['расхождение']]
+                print(f'\n    ПРОВЕРКА СХОДИМОСТИ: {len(проверки) - len(плохих)} из '
+                      f'{len(проверки)} сумм сходится')
+                for п in проверки:
+                    знак = ('сходится' if not п['расхождение']
+                            else f"РАСХОЖДЕНИЕ {п['расхождение']:+d}")
+                    print(f"      {п['что']:30} графа {п['графа']}: "
+                          f"{п['посчитано']:>8} против {п['в_бланке']:>8}   {знак}")
+                for в in rf.explain_mismatches(проверки, rf.table_rows(blocks, grid)):
+                    if в['строка']:
+                        print(f"      -> строка {в['строка']}, графа {в['графа']}: "
+                              f"прочитано {в['прочитано']}, вероятно {в['вероятно']} "
+                              f"({в['почему']})")
+                    else:
+                        print(f"      -> {в['почему']}")
+
         item = {'extra_fields': {}}
         rf.merge_fields(item, blocks, grid=grid)
         поля = item['extra_fields']

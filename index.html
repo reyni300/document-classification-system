@@ -1128,6 +1128,12 @@ function getMeasureCtx() {
 // порога в fitTextInBox (availH < 9) — тогда чип рисовался вообще БЕЗ
 // текста, пустым цветным пятном.
 const MIN_BOX_HEIGHT = 18;
+// Минимальная ШИРИНА плашки. Одинокая цифра в графе ("6" в строке «Запасы»)
+// обводится рамкой шириной с сам символ; формально значение в неё влезает,
+// но после внутренних отступов на текст остаётся пара пикселей, и вместо
+// цифры рисовался пустой цветной квадратик. Раньше это не вылезало только
+// потому, что OCR отдавал для таких ячеек рамку во всю ширину графы.
+const MIN_BOX_WIDTH = 34;
 
 // Горизонтальный отступ текста внутри чипа — общий для замера и отрисовки.
 const CHIP_PAD_X = 5;
@@ -1258,7 +1264,8 @@ function computeFieldLayout(mapping, parsed) {
   // просто обводить свой текст.
   items.forEach(it => {
     if (!it.value || !it.covers) return;
-    const needW = ctx.measureText(String(it.value)).width + CHIP_PAD_X * 2;
+    const needW = Math.max(MIN_BOX_WIDTH,
+                           ctx.measureText(String(it.value)).width + CHIP_PAD_X * 2);
     if (needW <= it.w0) return;
     let limit = it.x0 + Math.min(needW, it.w0 + MAX_BOX_GROW);
     if (canvasW) limit = Math.min(limit, canvasW - 2);
@@ -1270,6 +1277,23 @@ function computeFieldLayout(mapping, parsed) {
       limit = Math.min(limit, o.x0 - 3);    // упираемся, оставляя щель
     });
     it.w = Math.max(it.w0, limit - it.x0);
+
+    // Вправо упёрлись (край листа или соседнее поле), а места всё равно мало —
+    // добираем ВЛЕВО. Числа в графе прижаты к правому краю, слева внутри той
+    // же ячейки обычно пусто, так что расти туда безопаснее всего.
+    if (it.w < needW) {
+      let влево = needW - it.w;
+      let край = Math.max(0, it.x0 - влево);
+      items.forEach(o => {
+        if (o === it) return;
+        const vOverlap = Math.min(it.y + it.h, o.y + o.h) - Math.max(it.y, o.y);
+        if (vOverlap <= 0) return;
+        if (o.x0 + o.w0 >= it.x0) return;   // сосед не слева
+        край = Math.max(край, o.x0 + o.w0 + 3);
+      });
+      it.w += it.x0 - край;
+      it.x = край;
+    }
   });
 
   const byField = {};

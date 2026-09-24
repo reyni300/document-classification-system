@@ -6,3 +6,4 @@ blocks_dump.json
 .venv/
 venv/
 *.log
+blocks_dump.json
