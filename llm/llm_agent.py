@@ -22,46 +22,82 @@ LLM_MAX_ATTEMPTS = 2
 LLM_RETRY_DELAY_SEC = 5
 
 
-def salvage_truncated_json(text):
+_DECODER = json.JSONDecoder(strict=False)   # strict=False: перенос строки внутри значения
+
+
+def _skip_ws(text, i):
+    while i < len(text) and text[i] in ' \t\r\n':
+        i += 1
+    return i
+
+
+def _parse_object_prefix(text, i):
     """
-    Чинит ОБОРВАННЫЙ JSON от модели.
+    Читает объект JSON с позиции i (там стоит '{') пара за парой и
+    останавливается на первой повреждённой. Возвращает (словарь, позиция,
+    объект_дочитан_до_конца).
 
-    Мистраль иногда не дописывает ответ до конца — обрывается прямо посреди
-    значения ('"vat": nul'). Раньше такой ответ целиком уходил в мусор, хотя
-    первые поля в нём уже корректные. Отрезаем по последней запятой верхнего
-    уровня (то есть по последней ПОЛНОСТЬЮ записанной паре) и закрываем скобки.
+    Вложенный объект, который сам оборван, не выбрасывается: из него берутся
+    целые пары — так в extra_fields остаются поля, записанные до обрыва.
+    """
+    out = {}
+    i = _skip_ws(text, i + 1)
+    while i < len(text):
+        if text[i] == '}':
+            return out, i + 1, True
+        try:
+            key, i = _DECODER.raw_decode(text, i)
+        except ValueError:
+            break
+        if not isinstance(key, str):
+            break
+        i = _skip_ws(text, i)
+        if i >= len(text) or text[i] != ':':
+            break
+        i = _skip_ws(text, i + 1)
+        if i >= len(text):
+            break
+        try:
+            value, i = _DECODER.raw_decode(text, i)
+        except ValueError:
+            if text[i] == '{':
+                nested, _, _ = _parse_object_prefix(text, i)
+                if nested:
+                    out[key] = nested
+            break
+        out[key] = value
+        i = _skip_ws(text, i)
+        if i < len(text) and text[i] == ',':
+            i = _skip_ws(text, i + 1)
+            continue
+        if i < len(text) and text[i] == '}':
+            return out, i + 1, True
+        break
+    return out, i, False
 
-    Возвращает строку JSON или None, если спасать нечего.
+
+def parse_json_prefix(text):
+    """
+    Все целые поля из повреждённого ответа модели, словарём (или None).
+
+    Ответ mistral ломается по-разному: обрывается посреди значения
+    ('"vat": nul'), не доходит ни до одной закрывающей скобки, вставляет
+    перенос строки внутрь значения, пишет значение без кавычек. Во всех этих
+    случаях начало ответа — дата, сумма, валюта, номер, компания — записано
+    правильно, а раньше из-за поломки в конце выбрасывался весь ответ.
+    Читаем пары по порядку, пока они целые.
     """
     start = text.find('{')
     if start == -1:
         return None
+    data, _, _ = _parse_object_prefix(text, start)
+    return data or None
 
-    stack, cut, in_string, escaped = [], None, False, False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if escaped:
-            escaped = False
-            continue
-        if ch == '\\':
-            escaped = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch in '{[':
-            stack.append('}' if ch == '{' else ']')
-        elif ch in '}]':
-            if stack:
-                stack.pop()
-        elif ch == ',' and len(stack) == 1:
-            cut = i
 
-    if cut is None or not stack:
-        return None
-    return text[start:cut] + ''.join(reversed(stack))
+def salvage_truncated_json(text):
+    """Строка JSON из целых полей повреждённого ответа или None (прежнее имя)."""
+    data = parse_json_prefix(text)
+    return json.dumps(data, ensure_ascii=False) if data else None
 
 
 def _is_out_of_memory_error(err):
@@ -264,29 +300,20 @@ class LLMAgent:
             result = self._extract_from_text(pages_text[0], full_text=pages_text[0], page_num=1)
             final_result = [result] if result and "error" not in result else []
         else:
+            # Каждая страница разбирается отдельно и даёт свою запись с НАСТОЯЩИМ
+            # номером страницы. Раньше страницу без «№ цифры» склеивали с
+            # предыдущей и заменяли её запись общей: у двухстраничного баланса
+            # оставалась одна запись на оба листа, вторая страница оставалась
+            # без полей, а значения со второй страницы искались на первой.
+            # Номер записи был порядковым, а не номером страницы.
+            # Страницу, где модель не ответила, оркестратор соберёт правилами.
             all_results = []
             for i, page_text in enumerate(pages_text):
-                has_invoice = re.search(r'СЧЕТ\s*НА\s*ОПЛАТУ|Счет\s*№|№\s*\d+', page_text, re.IGNORECASE)
-                if has_invoice:
-                    result = self._extract_from_text(page_text, full_text=page_text, page_num=i + 1)
-                    if result and "error" not in result:
-                        all_results.append(result)
-                else:
-                    if all_results and i > 0:
-                        combined_text = pages_text[i - 1] + "\n\n" + page_text
-                        result = self._extract_from_text(combined_text, full_text=combined_text, page_num=i)
-                        if result and "error" not in result and len(all_results) > 0:
-                            all_results[-1] = result
-
-            if not all_results:
-                combined_text = "\n\n".join(pages_text)
-                result = self._extract_from_text(combined_text, full_text=combined_text, page_num=1)
+                result = self._extract_from_text(page_text, full_text=page_text, page_num=i + 1)
                 if result and "error" not in result:
-                    all_results = [result]
-
-            for i, result in enumerate(all_results):
-                result['_page'] = i + 1
-                result['_total_pages'] = len(all_results)
+                    result['_page'] = i + 1
+                    result['_total_pages'] = num_pages
+                    all_results.append(result)
 
             final_result = all_results
 
@@ -375,7 +402,12 @@ class LLMAgent:
                     # разобрать JSON"). В llm_client.py для классификатора то же
                     # самое стоит с самого начала.
                     format='json',
-                    options={'temperature': config['llm']['temperature']}
+                    options={
+                        'temperature': config['llm']['temperature'],
+                        # Явный предел длины ответа — чтобы он не зависел от
+                        # настроек по умолчанию конкретной версии Ollama.
+                        'num_predict': config['llm'].get('num_predict', 1024),
+                    }
                 )
                 break
             except Exception as e:
@@ -401,48 +433,29 @@ class LLMAgent:
         print(f"[LLM RAW OUTPUT page {page_num}]: {content[:200]}...")
 
         first_brace = content.find('{')
-        last_brace = content.rfind('}')
-        if first_brace == -1 or last_brace == -1:
+        if first_brace == -1:
             return self._fail(
                 f"в ответе модели нет JSON (получено {len(content)} симв.: "
                 f"{content[:120]!r})", page_num)
 
-        json_str = content[first_brace:last_brace + 1]
-        json_str = clean_json_trailing_commas(json_str)
-
-        try:
-            data = json.loads(json_str)
-        except json.JSONDecodeError:
-            objects = []
-            brace_count = 0
-            start_idx = -1
-            for i, ch in enumerate(content):
-                if ch == '{':
-                    if brace_count == 0:
-                        start_idx = i
-                    brace_count += 1
-                elif ch == '}':
-                    brace_count -= 1
-                    if brace_count == 0 and start_idx != -1:
-                        obj_str = content[start_idx:i + 1]
-                        try:
-                            obj_str_cleaned = clean_json_trailing_commas(obj_str)
-                            objects.append(json.loads(obj_str_cleaned))
-                        except:
-                            pass
-                        start_idx = -1
-            if objects:
-                data = objects[0]
-            else:
-                # последняя попытка: ответ мог просто оборваться на середине
-                repaired = salvage_truncated_json(content)
-                try:
-                    data = json.loads(clean_json_trailing_commas(repaired or ''))
-                    print(f"[LLM] ответ был оборван, спасено полей: {len(data)}")
-                except (json.JSONDecodeError, TypeError):
-                    return self._fail(
-                        f"не удалось разобрать JSON из ответа модели "
-                        f"({json_str[:120]!r})", page_num)
+        data = None
+        last_brace = content.rfind('}')
+        if last_brace > first_brace:
+            try:
+                data = json.loads(clean_json_trailing_commas(content[first_brace:last_brace + 1]),
+                                  strict=False)
+            except json.JSONDecodeError:
+                data = None
+        if not isinstance(data, dict):
+            # Ответ повреждён (оборван, лишний текст, значение без кавычек) —
+            # берём все целые поля с начала. Полный ответ пишем в лог
+            # сервиса: по нему видно, что именно сломалось.
+            data = parse_json_prefix(content)
+            print(f"[LLM FULL OUTPUT page {page_num}] ({len(content)} симв.): {content}")
+            if not data:
+                return self._fail(
+                    f"не удалось разобрать JSON из ответа модели ({content[:120]!r})", page_num)
+            print(f"[LLM] стр. {page_num}: ответ модели повреждён, взято целых полей: {len(data)}")
 
         try:
             validated = InvoiceData(**data)

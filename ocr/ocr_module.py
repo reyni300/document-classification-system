@@ -459,7 +459,13 @@ class OCRModule:
         return "\n".join(' '.join(b['text'] for b in sorted(line, key=lambda q: q['left']))
                          for line in lines)
 
-    def extract(self, file_path):
+    def extract(self, file_path, pages_dir=None):
+        """
+        pages_dir — куда сохранить PNG страниц PDF. Сервис разбора передаёт
+        папку своего разбора: картинка страницы хранится рядом с результатом,
+        и координаты полей относятся ровно к ней. Без параметра — прежняя
+        общая временная папка.
+        """
         all_pages = []
 
         if file_path.lower().endswith(".pdf"):
@@ -469,7 +475,8 @@ class OCRModule:
 
             for page_num, img_pil in enumerate(images):
                 # Сохраняем PNG-версию страницы для предпросмотра в браузере
-                png_path = os.path.join(PDF_PAGES_DIR, f"{base_name}_page{page_num + 1}.png")
+                png_path = (os.path.join(pages_dir, f"page-{page_num + 1}.png") if pages_dir
+                            else os.path.join(PDF_PAGES_DIR, f"{base_name}_page{page_num + 1}.png"))
                 img_pil.save(png_path, "PNG")
 
                 text, blocks, grid = self._recognize(np.array(img_pil))

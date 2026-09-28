@@ -1,11 +1,18 @@
 import json
+import os
 import requests
 
 
 class LLMClient:
     def __init__(self, model="mistral"):
         self.model = model
-        self.url = "http://localhost:11434/api/generate"
+        # Адрес Ollama берём из той же переменной, что читает библиотека
+        # ollama в llm_agent.py: в docker-compose сервис разбора ходит к
+        # Ollama не на localhost, а на host.docker.internal.
+        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        if "://" not in host:
+            host = "http://" + host
+        self.url = host + "/api/generate"
 
     def generate(self, prompt: str):
         try:

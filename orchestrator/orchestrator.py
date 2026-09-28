@@ -18,12 +18,29 @@ with open("config.yaml", "r", encoding="utf-8") as f:
 class Orchestrator:
     def __init__(self, ocr_module, llm_agent, db_module, classifier, validator,
                  translator_func=None):
+        # db_module может быть None: так оркестратор работает внутри сервиса
+        # разбора, где результат хранит сам сервис (data/parses/<id>/), а не
+        # SQLite. Настольное приложение (gui) по-прежнему передаёт базу.
         self.ocr = ocr_module
         self.llm = llm_agent
         self.db = db_module
         self.classifier = classifier
         self.validator = validator
         self.translator = translator_func
+
+    @staticmethod
+    def _rules_record(page, number):
+        """Запись одной страницы, собранная только правилами (rule_fields)."""
+        item = {
+            '_page': number,
+            'total': None, 'date': None, 'company': None,
+            'invoice_number': None, 'vat': None, 'currency': None,
+            'document_type': 'документ',
+            'extra_fields': {},
+            'extracted_by': 'rules',
+        }
+        found = rule_fields.merge_fields(item, page.get('blocks', []), grid=page.get('grid'))
+        return item, found
 
     def _parse_by_rules(self, ocr_data, logs):
         """
@@ -34,22 +51,38 @@ class Orchestrator:
         pages = ocr_data.get('pages', []) if ocr_data else []
         by_rules = []
         for i, page in enumerate(pages):
-            item = {
-                '_page': i + 1,
-                'total': None, 'date': None, 'company': None,
-                'invoice_number': None, 'vat': None, 'currency': None,
-                'document_type': 'документ',
-                'extra_fields': {},
-                'extracted_by': 'rules',
-            }
-            found = rule_fields.merge_fields(item, page.get('blocks', []),
-                                              grid=page.get('grid'))
+            item, found = self._rules_record(page, i + 1)
             logs.append(f"  Стр. {i + 1}: правила нашли полей — {found}")
             if found:
                 by_rules.append(item)
         return by_rules
 
-    def process_document(self, file_path, filename):
+    def _fill_missing_pages(self, parsed_list, ocr_data, logs):
+        """
+        У каждой страницы документа должна быть своя запись. Если модель не
+        дала записи для какой-то страницы (не ответила на ней, оборвала ответ),
+        собираем эту страницу правилами — иначе она осталась бы вообще без
+        полей и без подсветки.
+        """
+        pages = ocr_data.get('pages', []) if ocr_data else []
+        covered = {p.get('_page', idx + 1) for idx, p in enumerate(parsed_list)}
+        for i, page in enumerate(pages):
+            if i + 1 in covered:
+                continue
+            item, found = self._rules_record(page, i + 1)
+            logs.append(f"  Стр. {i + 1}: модель не дала записи — правила нашли полей: {found}")
+            if found:
+                parsed_list.append(item)
+        parsed_list.sort(key=lambda p: p.get('_page') or 0)
+        return parsed_list
+
+    def process_document(self, file_path, filename, work_dir=None):
+        """
+        work_dir — папка для промежуточных файлов (предобработанная картинка,
+        PNG страниц PDF). Сервис разбора передаёт папку конкретного разбора,
+        чтобы два документа не писали в один и тот же data/temp_proc.png.
+        Без неё поведение прежнее.
+        """
         logs = []
         doc_id = None
         llm_failure = None
@@ -59,12 +92,15 @@ class Orchestrator:
             logs.append(f"НАЧАЛО ОБРАБОТКИ: {filename}")
 
             logs.append("ШАГ 1: Предобработка изображения...")
-            processed_path = preprocess_image(file_path) if file_path.lower().endswith(
-                ('.png', '.jpg', '.jpeg')) else file_path
+            processed_path = preprocess_image(
+                file_path,
+                os.path.join(work_dir, 'preprocessed.png') if work_dir else None,
+            ) if file_path.lower().endswith(('.png', '.jpg', '.jpeg')) else file_path
             logs.append("Предобработка завершена")
 
             logs.append("ШАГ 2: Распознавание текста (OCR)...")
-            ocr_data = self.ocr.extract(processed_path if processed_path else file_path)
+            ocr_data = self.ocr.extract(processed_path if processed_path else file_path,
+                                        pages_dir=work_dir)
 
             full_ocr_text = "\n\n--- РАЗРЫВ СТРАНИЦЫ ---\n\n".join(
                 page['text'] for page in ocr_data['pages']
@@ -127,6 +163,9 @@ class Orchestrator:
                 if i < len(original_pages_text):
                     page['text'] = original_pages_text[i]
 
+            if len(ocr_data['pages']) > 1:
+                parsed_list = self._fill_missing_pages(parsed_list, ocr_data, logs)
+
             logs.append("ШАГ 6: Классификация и валидация...")
             enriched_parsed_list = []
             for idx, parsed in enumerate(parsed_list):
@@ -176,8 +215,15 @@ class Orchestrator:
                 страница = (pages[page_idx] if 0 <= page_idx < len(pages)
                             else (pages[0] if pages else {}))
                 page_blocks = страница.get('blocks', [])
+                до_правил = dict(enriched.get('extra_fields') or {})
                 by_rules = rule_fields.merge_fields(enriched, page_blocks,
                                                     grid=страница.get('grid'))
+                # Какие значения поставили правила (добавили или дочитали за
+                # моделью) — сервис разбора отдаёт у каждого поля его источник.
+                enriched['_rule_fields'] = [
+                    k for k, v in (enriched.get('extra_fields') or {}).items()
+                    if до_правил.get(k) != v
+                ]
 
                 enriched_parsed_list.append(enriched)
 
@@ -185,26 +231,30 @@ class Orchestrator:
                 logs.append(
                     f"  Запись {idx + 1}: категория={enriched['category']}, валидация={'ПРОЙДЕНА' if validation['valid'] else 'НЕ ПРОЙДЕНА'}")
 
-            logs.append("ШАГ 7: Сохранение в базу данных...")
-            ocr_version = ocr_data['ocr_engine']
-            llm_version = config['llm'].get('version', config['llm']['model'])
+            if self.db is not None:
+                logs.append("ШАГ 7: Сохранение в базу данных...")
+                ocr_version = ocr_data['ocr_engine']
+                llm_version = config['llm'].get('version', config['llm']['model'])
 
-            doc_id = self.db.save(
-                filename=filename,
-                ocr_text=full_ocr_text,
-                parsed_data=enriched_parsed_list,
-                ocr_version=ocr_version,
-                llm_version=llm_version
-            )
+                doc_id = self.db.save(
+                    filename=filename,
+                    ocr_text=full_ocr_text,
+                    parsed_data=enriched_parsed_list,
+                    ocr_version=ocr_version,
+                    llm_version=llm_version
+                )
 
-            self.db.log_event(doc_id, "OCR_COMPLETE", f"Engine: {ocr_version}")
-            self.db.log_event(doc_id, "LLM_PARSE", f"Извлечено {len(parsed_list)} записей")
-            self.db.log_event(doc_id, "MULTI_PAGE", f"Документ содержит {len(parsed_list)} страниц/счетов")
+                self.db.log_event(doc_id, "OCR_COMPLETE", f"Engine: {ocr_version}")
+                self.db.log_event(doc_id, "LLM_PARSE", f"Извлечено {len(parsed_list)} записей")
+                self.db.log_event(doc_id, "MULTI_PAGE", f"Документ содержит {len(parsed_list)} страниц/счетов")
 
-            for log_msg in logs:
-                self.db.log_event(doc_id, "ОРКЕСТРАТОР", log_msg)
+                for log_msg in logs:
+                    self.db.log_event(doc_id, "ОРКЕСТРАТОР", log_msg)
 
-            logs.append(f"Сохранено в БД с ID: {doc_id}")
+                logs.append(f"Сохранено в БД с ID: {doc_id}")
+            else:
+                logs.append("ШАГ 7: Сохранение в базу пропущено — результат хранит сервис разбора")
+
             logs.append("ОБРАБОТКА ЗАВЕРШЕНА УСПЕШНО")
 
             return {
@@ -214,8 +264,8 @@ class Orchestrator:
                 "logs": logs,
                 "ocr_text_preview": full_ocr_text[:500],
                 # Отдаём наверх те же самые страницы/блоки, на которых реально считал LLM —
-                # чтобы web_server.py строил маппинг полей по НИМ, а не гонял OCR второй раз
-                # по другому варианту изображения (см. комментарий в web_server.py)
+                # чтобы сервис разбора (parser_service/pipeline.py) искал координаты
+                # полей по НИМ, а не гонял OCR второй раз по другому варианту изображения
                 "ocr_pages": ocr_data['pages'] if ocr_data else []
             }
 

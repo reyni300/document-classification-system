@@ -61,9 +61,29 @@
   .workspace {
     display: grid;
     grid-template-columns: 300px 1fr 1fr;
-    grid-template-rows: 1fr auto;
+    grid-template-rows: auto 1fr auto;
     flex: 1; min-height: 0; height: calc(100vh - 57px);
   }
+
+  /* ── Плашка «Результат по ссылке» над предпросмотром и результатом ── */
+  .parse-bar {
+    grid-column: 2 / -1; grid-row: 1;
+    display: none; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 10px 18px;
+    background: linear-gradient(90deg, rgba(79,142,247,.16), rgba(124,92,252,.10));
+    border-bottom: 1px solid rgba(79,142,247,.45);
+    border-left: 3px solid var(--accent);
+  }
+  .parse-bar.visible { display: flex; }
+  .parse-bar-title { font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; }
+  .parse-bar-id {
+    font-family: var(--mono); font-size: 12px; color: var(--accent);
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 10px; user-select: all; cursor: text;
+  }
+  .parse-bar-file { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+  .parse-bar-actions { display: flex; gap: 8px; margin-left: auto; }
+  .parse-bar-actions .btn { width: auto; padding: 7px 14px; font-size: 12px; text-decoration: none; }
 
   .panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
   .panel:last-child { border-right: none; }
@@ -103,6 +123,13 @@
   .btn-danger { background: rgba(247,111,111,.1); border: 1px solid rgba(247,111,111,.3); color: var(--red); }
   .btn-danger:hover:not(:disabled) { background: rgba(247,111,111,.18); }
   .separator { height: 1px; background: var(--border); margin: 2px 0; }
+
+  /* ── Открыть результат по ID ── */
+  .id-open { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .id-open-title { font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); }
+  .id-open-row { display: flex; gap: 6px; }
+  .id-open-row .search-input { min-width: 0; font-family: var(--mono); font-size: 11px; padding: 6px 8px; }
+  .id-open-row .btn { width: auto; padding: 6px 12px; font-size: 12px; }
 
   .tech-block { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
   .tech-block-title { padding: 7px 12px; font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
@@ -276,7 +303,7 @@
   .category-tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 20px; font-size: 10px; font-weight: 600; background: rgba(79,142,247,.12); color: var(--accent); border: 1px solid rgba(79,142,247,.2); text-transform: uppercase; letter-spacing: .5px; }
 
   /* ── Log ── */
-  .log-panel { grid-column: 1 / -1; border-top: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; max-height: 150px; flex-shrink: 0; }
+  .log-panel { grid-column: 1 / -1; grid-row: 3; border-top: 1px solid var(--border); background: var(--surface); display: flex; flex-direction: column; max-height: 150px; flex-shrink: 0; }
   .log-header { display: flex; align-items: center; justify-content: space-between; padding: 7px 16px; border-bottom: 1px solid var(--border); cursor: pointer; user-select: none; }
   .log-title { font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); display: flex; align-items: center; gap: 8px; }
   .log-toggle { font-size: 10px; color: var(--muted); transition: transform .2s; }
@@ -305,7 +332,10 @@
   tbody tr:hover { background: var(--card); }
   tbody tr.selected { background: rgba(79,142,247,.08); }
   tbody td { padding: 9px 13px; color: var(--text); }
-  tbody td.id { font-family: var(--mono); color: var(--muted); }
+  tbody td.id { font-family: var(--mono); color: var(--muted); white-space: nowrap; }
+  .hist-id { user-select: all; font-size: 12px; }
+  .copy-id-btn { margin-left: 8px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--card); color: var(--text); font-size: 11px; cursor: pointer; transition: all .15s; }
+  .copy-id-btn:hover { border-color: var(--accent); color: var(--accent); }
   tbody td.filename { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   tbody td.date { font-family: var(--mono); font-size: 12px; color: var(--muted); }
   tbody td.amount { font-family: var(--mono); font-weight: 600; color: var(--accent); }
@@ -416,7 +446,7 @@
     <div class="workspace">
 
       <!-- Left: Controls -->
-      <div class="panel controls-panel" style="grid-row:1">
+      <div class="panel controls-panel" style="grid-row:1 / 3">
         <div class="panel-header">
           <span class="panel-title">Управление</span>
           <span class="panel-badge" id="fileCountBadge">0 файлов</span>
@@ -445,7 +475,18 @@
               <div class="tech-row"><span class="k">LLM модель</span><span class="v blue">Mistral (Ollama)</span></div>
               <div class="tech-row"><span class="k">Перевод</span><span class="v green">Включён</span></div>
               <div class="tech-row"><span class="k">Валидация</span><span class="v green">Включена</span></div>
-              <div class="tech-row"><span class="k">База данных</span><span class="v">SQLite</span></div>
+              <div class="tech-row"><span class="k">Разбор</span><span class="v" id="parserHealth" title="Отдельный сервис разбора, API /api/v1">сервис · проверка…</span></div>
+              <div class="tech-row"><span class="k">Хранение</span><span class="v">по ID разбора</span></div>
+            </div>
+          </div>
+
+          <!-- Любой ранее полученный ID: вставить и открыть результат, не загружая файл заново -->
+          <div class="id-open">
+            <div class="id-open-title">Открыть результат по ID</div>
+            <div class="id-open-row">
+              <input class="search-input" type="text" id="openIdInput" placeholder="ID разбора или ссылка"
+                     onkeydown="if (event.key === 'Enter') openFromInput()">
+              <button class="btn btn-secondary" id="openIdBtn" onclick="openFromInput()">Открыть</button>
             </div>
           </div>
 
@@ -455,7 +496,18 @@
       </div>
 
       <!-- Middle: Preview -->
-      <div class="panel preview-panel" style="grid-row:1; position:relative;">
+      <!-- Результат по ссылке: ID разбора и ссылка, по которой его открывает кто угодно -->
+      <div class="parse-bar" id="parseBar">
+        <span class="parse-bar-title">🔗 Результат по ссылке</span>
+        <span class="parse-bar-id" id="parseBarId" title="ID разбора — выделите, чтобы скопировать"></span>
+        <span class="parse-bar-file" id="parseBarFile"></span>
+        <div class="parse-bar-actions">
+          <button class="btn btn-primary" onclick="copyParseLink()">⎘ Скопировать ссылку</button>
+          <a class="btn btn-secondary" id="parseBarOpen" href="#" target="_blank" rel="noopener">↗ Открыть в новой вкладке</a>
+        </div>
+      </div>
+
+      <div class="panel preview-panel" style="grid-row:2; position:relative;">
         <div class="panel-header">
           <span class="panel-title">Предпросмотр</span>
           <span class="panel-badge" id="previewCounter">—</span>
@@ -504,7 +556,7 @@
       </div>
 
       <!-- Right: Results -->
-      <div class="panel results-panel" style="grid-row:1;">
+      <div class="panel results-panel" style="grid-row:2;">
         <div class="panel-header">
           <span class="panel-title">Результат анализа</span>
           <span class="panel-badge" id="resultCounter">—</span>
@@ -577,10 +629,12 @@
     <div class="history-toolbar">
       <input class="search-input" type="text" id="historySearch" placeholder="Поиск по файлу, категории, сумме..." oninput="filterHistory()">
       <button class="btn btn-secondary" style="width:auto;padding:7px 12px;font-size:12px" onclick="loadHistory()">↺ Обновить</button>
+      <button class="btn btn-secondary" style="width:auto;padding:7px 12px;font-size:12px" onclick="openSelected()" title="Открыть результат с подсветкой (или двойной щелчок по строке)">▶ Открыть</button>
+      <button class="btn btn-secondary" style="width:auto;padding:7px 12px;font-size:12px" onclick="viewSelectedJson()" title="Результат разбора в JSON, как его отдаёт сервис">{ } JSON</button>
       <button class="btn btn-danger"    style="width:auto;padding:7px 12px;font-size:12px" onclick="deleteSelected()">✕ Удалить</button>
     </div>
     <table>
-      <thead><tr><th>ID</th><th>Файл</th><th>Дата обработки</th><th>Сумма</th><th>Категория</th></tr></thead>
+      <thead><tr><th>ID разбора</th><th>Файл</th><th>Дата обработки</th><th>Сумма</th><th>Категория</th></tr></thead>
       <tbody id="historyBody">
         <tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">История загрузится при открытии вкладки</td></tr>
       </tbody>
@@ -609,10 +663,11 @@
 // STATE
 // ════════════════════════════════════════════════
 const state = {
-  files: [],              // { file, name, pages:[{blob,rotation}], status, result }
+  files: [],              // { file, name, pages:[{blob,rotation}], status, result, parseId }
+                          // file === null — документ открыт по ID разбора, а не загружен
   currentFileIdx: 0,
   currentPageIdx: 0,
-  results: [],            // { filename, parsed_list, logs, doc_id, pages_blocks, field_mappings }
+  results: [],            // { parse_id, filename, parsed_list, field_mappings, png_urls, logs, warnings, raw }
   currentResFileIdx: 0,
   currentResPageIdx: 0,
   processing: false,
@@ -723,7 +778,7 @@ function renderFileList() {
     const div = document.createElement('div');
     div.className = 'file-item' + (i === state.currentFileIdx ? ' active' : '');
     div.onclick = () => selectFile(i);
-    const isPDF = f.file.type === 'application/pdf';
+    const isPDF = f.file ? f.file.type === 'application/pdf' : /\.pdf$/i.test(f.name);
     const firstBlob = f.pages[0] && f.pages[0].blob;
     const thumbHTML = (!isPDF && firstBlob) ? `<img src="${firstBlob}" alt="">` : '📄';
     const statusColor = {idle:'var(--muted)',processing:'var(--amber)',done:'var(--green)',error:'var(--red)'}[f.status];
@@ -732,7 +787,7 @@ function renderFileList() {
       <div class="file-thumb">${thumbHTML}</div>
       <div class="file-info">
         <div class="file-name" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
-        <div class="file-meta">${f.pages.length} стр. &nbsp;<span style="color:${statusColor}">${statusIcon}</span></div>
+        <div class="file-meta">${f.pages.length} стр. &nbsp;<span style="color:${statusColor}">${statusIcon}</span>${f.parseId ? ` &nbsp;<span title="ID разбора ${escHtml(f.parseId)}" style="font-family:var(--mono)">ID ${escHtml(f.parseId.slice(0, 8))}</span>` : ''}</div>
       </div>
       <button class="file-remove" onclick="removeFile(event,${i})">×</button>`;
     list.appendChild(div);
@@ -876,7 +931,7 @@ function downloadCurrentPage() {
   const baseName = f.name.replace(/\.[^.]+$/, '');
   a.download = `${baseName}${pageNum}.png`;
 
-  // Если blob — это URL с сервера (/api/page-image/...), качаем напрямую
+  // Если blob — это URL с сервера (картинка страницы из сервиса разбора), качаем напрямую
   // Если это data URL (blob:// или data:) — создаём ссылку
   if (page.blob.startsWith('/') || page.blob.startsWith('http')) {
     a.href = page.blob;
@@ -912,6 +967,7 @@ function clearAll() {
   state.files = []; state.currentFileIdx = 0; state.currentPageIdx = 0;
   state.results = []; state.currentResFileIdx = 0; state.currentResPageIdx = 0;
   renderFileList(); showPreview(); updateButtons(); clearHighlights();
+  renderParseBar(null);
   document.getElementById('resultEmpty').style.display = '';
   document.getElementById('resultEmpty').innerHTML = `
     <div class="result-empty-icon">📊</div>
@@ -1795,29 +1851,23 @@ async function startProcessing() {
     document.getElementById('processingStep').textContent = `${i+1}/${state.files.length}: ${f.name}`;
 
     try {
-      const result = await processFile(f);
+      const result = await processFile(f, i);
       f.status = 'done'; f.result = result;
       state.results[i] = result;
 
-      // Подменяем blob PDF-страниц на PNG-урлы с сервера (качественный рендер)
-      if (result.png_urls && result.png_urls.length > 0 && f.name.toLowerCase().endsWith('.pdf')) {
-        result.png_urls.forEach((url, pageIdx) => {
-          if (url && f.pages[pageIdx]) {
-            f.pages[pageIdx].blob = url;
-          }
-        });
-        // Обновляем превью если сейчас смотрим этот файл
-        if (state.currentFileIdx === i) showPreview();
-      }
-      if (result.logs) result.logs.forEach(l =>
-        addLog(l, l.includes('ОШИБКА')||l.includes('✗') ? 'error' : l.includes('ШАГ') ? 'step' : l.includes('ЗАВЕРШЕНА') ? 'success' : 'info')
-      );
-      addLog(`✓ ${f.name}: ${result.parsed_list.length} записей`, 'success');
+      // Картинки страниц берём у сервиса разбора — для PDF и для фото:
+      // координаты полей относятся ровно к ним (у фото с поворотом по EXIF
+      // браузер показал бы исходник повёрнутым, и рамки съехали бы).
+      applyServerPages(f, result);
+      if (state.currentFileIdx === i) showPreview();
+      logParseMessages(result);
+      addLog(`✓ ${f.name}: ${(result.raw.documents || []).length} записей, страниц ${result.parsed_list.length} · ID разбора ${result.parse_id}`, 'success');
       newCount++;
     } catch(e) {
       f.status = 'error';
-      state.results[i] = { filename: f.name, parsed_list: [], logs: [], pages_blocks: [], field_mappings: [], error: String(e) };
-      addLog(`✗ ${f.name}: ${e}`, 'error');
+      state.results[i] = { filename: f.name, parsed_list: [], logs: [], field_mappings: [], error: e.message || String(e) };
+      (e.logs || []).forEach(l => addLog(l, 'info'));
+      addLog(`✗ ${f.name}: ${e.message || e}`, 'error');
     }
     renderFileList();
   }
@@ -1843,15 +1893,7 @@ async function startProcessing() {
   }
 
   const hasResults = state.results.some(r => r && r.parsed_list && r.parsed_list.length > 0);
-  if (hasResults) {
-    document.getElementById('resultEmpty').style.display = 'none';
-    document.getElementById('resultContent').style.display = 'block';
-    document.getElementById('resultNav').style.display = 'flex';
-    document.getElementById('actionsRow').style.display = 'flex';
-    document.getElementById('annotatedOverlayBar').style.display = 'flex';
-    renderResult();
-    rebuildOcrHitLayer();
-  }
+  if (hasResults) showResultPanels();
 
   const doneCount = state.results.filter(r => r && r.parsed_list && r.parsed_list.length > 0).length;
   setStatus(doneCount > 0 ? 'done' : 'error', doneCount > 0 ? 'Завершено' : 'Ошибки');
@@ -1859,12 +1901,225 @@ async function startProcessing() {
   loadHistory().catch(()=>{});
 }
 
-async function processFile(fileObj) {
+// ════════════════════════════════════════════════
+// СЕРВИС РАЗБОРА (API /api/v1, docs/parser_api.md)
+// Файл уходит в сервис, тот сразу отдаёт ID разбора; результат забираем
+// по этому ID, когда он готов. Страница сама ничего не распознаёт.
+// ════════════════════════════════════════════════
+const POLL_INTERVAL_MS = 2000;
+
+function apiErrorText(body, httpStatus) {
+  if (body && body.error) return typeof body.error === 'string' ? body.error : (body.error.message || body.error.code);
+  return `HTTP ${httpStatus}`;
+}
+
+async function apiJson(url, options) {
+  const r = await fetch(url, options);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(apiErrorText(body, r.status)); e.httpStatus = r.status; throw e; }
+  return body;
+}
+
+async function processFile(fileObj, fileIdx) {
   const formData = new FormData();
   formData.append('file', fileObj.file, fileObj.name);
-  const r = await fetch('/api/process', { method: 'POST', body: formData });
-  if (!r.ok) { const err = await r.json().catch(()=>({})); throw new Error(err.error || `HTTP ${r.status}`); }
-  return await r.json();
+  const created = await apiJson('/api/v1/parses', { method: 'POST', body: formData });
+  fileObj.parseId = created.id;
+  addLog(`Отправлено в сервис разбора, ID ${created.id}`, 'info');
+  const view = await waitForParse(created.id, v => {
+    document.getElementById('processingStep').textContent =
+      `${fileIdx + 1}/${state.files.length}: ${fileObj.name} — ${parseStatusText(v)}`;
+  });
+  return resultToView(view.result);
+}
+
+function parseStatusText(v) {
+  if (v.status === 'queued') return v.queue_position ? `в очереди (№${v.queue_position})` : 'в очереди';
+  if (v.status === 'processing') {
+    const sec = v.started_at ? Math.max(0, Math.round((Date.now() - Date.parse(v.started_at)) / 1000)) : 0;
+    return `распознаётся ${sec} с`;
+  }
+  return v.status;
+}
+
+// Опрашиваем статус, пока разбор не закончится. Отдаёт ответ сервиса со
+// статусом done (в нём уже лежит result) или бросает ошибку с журналом.
+async function waitForParse(id, onProgress) {
+  for (;;) {
+    const v = await apiJson('/api/v1/parses/' + encodeURIComponent(id));
+    if (v.status === 'done') return v;
+    if (v.status === 'failed') {
+      const e = new Error(v.error || 'Разбор не удался');
+      e.logs = v.logs || [];
+      throw e;
+    }
+    if (onProgress) onProgress(v);
+    await new Promise(res => setTimeout(res, POLL_INTERVAL_MS));
+  }
+}
+
+// Результат сервиса -> то представление, с которым работает подсветка:
+// parsed_list[i] — значения полей записи, field_mappings[i] — их рамки.
+// Координаты берутся из результата как есть: рамка = прямоугольник поля.
+function resultToView(result) {
+  // Интерфейс листает результат постранично: parsed_list[i] — запись
+  // страницы i+1. Поэтому раскладываем записи по номеру страницы, а не по
+  // порядку в списке: у страницы без записи — пустая запись, и записи
+  // соседних страниц не съезжают на чужой лист.
+  const pageCount = Math.max((result.pages || []).length, 1);
+  const parsed_list = [], field_mappings = [];
+  for (let n = 1; n <= pageCount; n++) {
+    parsed_list.push({ _page: n, _empty: true, extra_fields: {}, validation_valid: true, validation_errors: [] });
+    field_mappings.push({});
+  }
+  const placed = new Set();
+  (result.documents || []).forEach(doc => {
+    const slot = Math.min(Math.max((doc.page || 1) - 1, 0), pageCount - 1);
+    if (placed.has(slot)) return;          // одна запись на страницу
+    placed.add(slot);
+    const parsed = {
+      _page: doc.page,
+      document_type: doc.document_type,
+      category: doc.category,
+      extracted_by: doc.extracted_by,
+      validation_valid: doc.validation ? doc.validation.valid : true,
+      validation_errors: doc.validation ? doc.validation.errors : [],
+      extra_fields: {},
+    };
+    const mapping = {};
+    (doc.fields || []).forEach(f => {
+      const key = f.kind === 'standard' ? f.name : 'extra::' + f.name;
+      if (f.kind === 'standard') parsed[f.name] = f.value;
+      else parsed.extra_fields[f.name] = f.value;
+      if (f.boxes && f.boxes.length) {
+        mapping[key] = f.boxes.map(b => ({
+          text: b.text, left: b.x, top: b.y, width: b.w, height: b.h, confidence: b.confidence,
+        }));
+      }
+    });
+    parsed_list[slot] = parsed;
+    field_mappings[slot] = mapping;
+  });
+  return {
+    parse_id: result.id,
+    filename: result.source ? result.source.filename : '',
+    parsed_list,
+    field_mappings,
+    png_urls: (result.pages || []).map(p => p.image_url || null),
+    logs: result.logs || [],
+    warnings: result.warnings || [],
+    raw: result,
+  };
+}
+
+function applyServerPages(fileObj, view) {
+  view.png_urls.forEach((url, pageIdx) => {
+    if (!url) return;
+    if (fileObj.pages[pageIdx]) fileObj.pages[pageIdx].blob = url;
+    else fileObj.pages[pageIdx] = { blob: url, rotation: 0 };
+  });
+}
+
+function logParseMessages(view) {
+  (view.logs || []).forEach(l =>
+    addLog(l, l.includes('ОШИБКА')||l.includes('✗') ? 'error' : l.includes('ШАГ') ? 'step' : l.includes('ЗАВЕРШЕНА') ? 'success' : 'info')
+  );
+  (view.warnings || []).forEach(w => addLog('⚠ ' + w, 'error'));
+}
+
+function showResultPanels() {
+  document.getElementById('resultEmpty').style.display = 'none';
+  document.getElementById('resultContent').style.display = 'block';
+  document.getElementById('resultNav').style.display = 'flex';
+  document.getElementById('actionsRow').style.display = 'flex';
+  document.getElementById('annotatedOverlayBar').style.display = 'flex';
+  renderResult();
+  rebuildOcrHitLayer();
+}
+
+// Открыть готовый разбор по его ID: из ссылки ?id=..., из истории.
+// Это и есть «компонента, которая получает ID и забирает результат».
+async function openParseById(id) {
+  const existing = state.files.findIndex(f => f.parseId === id && f.status === 'done');
+  if (existing !== -1) {
+    // Этот разбор уже открыт на странице — повторно не загружаем, а
+    // переключаемся на него и явно об этом говорим (иначе кажется, что
+    // кнопка ничего не сделала).
+    focusFile(existing);
+    showToast(`Разбор ${id.slice(0, 8)} уже открыт: ${state.files[existing].name}`, 'info');
+    return;
+  }
+
+  setStatus('processing', 'Загрузка результата...');
+  const overlay = document.getElementById('processingOverlay');
+  overlay.classList.add('active');
+  document.getElementById('processingStep').textContent = 'ID ' + id;
+  try {
+    const view = await waitForParse(id, v => {
+      document.getElementById('processingStep').textContent = `ID ${id} — ${parseStatusText(v)}`;
+    });
+    const res = resultToView(view.result);
+    const fileObj = { file: null, name: res.filename || id, pages: [], status: 'done', result: res, parseId: id };
+    applyServerPages(fileObj, res);
+    state.files.push(fileObj);
+    state.results[state.files.length - 1] = res;
+    clearLog();
+    logParseMessages(res);
+    focusFile(state.files.length - 1);
+    setStatus('done', 'Открыт разбор ' + id.slice(0, 8));
+  } catch (e) {
+    setStatus('error', 'Ошибка');
+    (e.logs || []).forEach(l => addLog(l, 'info'));
+    addLog(`✗ Разбор ${id}: ${e.message}`, 'error');
+    showToast(e.httpStatus === 404 ? 'Разбор с таким ID не найден' : 'Ошибка: ' + e.message, 'error');
+  } finally {
+    overlay.classList.remove('active');
+  }
+}
+
+// Поле «Открыть результат по ID»: принимает сам ID или ссылку с ?id=...
+function openFromInput() {
+  const input = document.getElementById('openIdInput');
+  const m = input.value.match(/[0-9a-f]{32}/i);
+  if (!m) {
+    showToast('Не похоже на ID разбора: нужно 32 символа из цифр и букв a–f', 'error');
+    return;
+  }
+  input.value = '';
+  openParseById(m[0].toLowerCase());
+}
+
+function focusFile(idx) {
+  state.currentFileIdx = idx; state.currentPageIdx = 0;
+  state.currentResFileIdx = idx; state.currentResPageIdx = 0;
+  switchTab('process', document.querySelector('.tab-btn'));
+  renderFileList(); showPreview(); updateButtons(); updateNavButtons();
+  showResultPanels();
+}
+
+function parseLink(parseId) {
+  return `${location.origin}${location.pathname}?id=${parseId}`;
+}
+
+// Плашка над документом: ID разбора текущего результата и ссылка на него.
+// Нет ID (файл ещё не обработан или разбор не удался) — плашки нет.
+function renderParseBar(res) {
+  const bar = document.getElementById('parseBar');
+  if (!res || !res.parse_id) { bar.classList.remove('visible'); return; }
+  document.getElementById('parseBarId').textContent = res.parse_id;
+  document.getElementById('parseBarFile').textContent = res.filename || '';
+  document.getElementById('parseBarFile').title = res.filename || '';
+  document.getElementById('parseBarOpen').href = parseLink(res.parse_id);
+  bar.classList.add('visible');
+}
+
+function copyParseLink() {
+  const res = state.results[state.currentResFileIdx];
+  if (!res || !res.parse_id) return;
+  const url = parseLink(res.parse_id);
+  navigator.clipboard.writeText(url)
+    .then(() => showToast('Ссылка на результат скопирована', 'success'))
+    .catch(() => showToast(url, 'info'));
 }
 
 // ════════════════════════════════════════════════
@@ -1895,6 +2150,7 @@ function navigateResultPage(dir) {
 
 function renderResult() {
   const res   = state.results[state.currentResFileIdx];
+  renderParseBar(res);
   const empty = document.getElementById('resultEmpty');
   const cont  = document.getElementById('resultContent');
 
@@ -2166,7 +2422,8 @@ function setStatus(type, text) {
 function exportJSON() {
   const res = state.results[state.currentResFileIdx];
   if (!res) return;
-  const blob = new Blob([JSON.stringify(res, null, 2)], { type: 'application/json' });
+  // Выгружаем результат ровно в том виде, в каком его отдаёт сервис разбора
+  const blob = new Blob([JSON.stringify(res.raw || res, null, 2)], { type: 'application/json' });
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
   a.download = `result_${res.filename||'document'}.json`; a.click();
   showToast('JSON сохранён', 'success');
@@ -2180,11 +2437,22 @@ function copyResult() {
     .catch(()=>showToast('Ошибка копирования', 'error'));
 }
 
+const PARSE_STATUS_LABEL = { queued: '⟳ в очереди', processing: '⟳ распознаётся', failed: '✗ ошибка' };
+
 async function loadHistory() {
   try {
-    const r = await fetch('/api/history');
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    state.history = await r.json(); renderHistory(state.history);
+    const data = await apiJson('/api/v1/parses?limit=200');
+    state.history = (data.items || []).map(it => ({
+      id: it.id,
+      filename: it.filename,
+      date: (it.created_at || '').slice(0, 10),
+      status: it.status,
+      error: it.error,
+      total: it.summary ? it.summary.total : null,
+      currency: it.summary ? it.summary.currency : '',
+      category: it.summary ? it.summary.category : null,
+    }));
+    renderHistory(state.history);
   } catch(e) {
     document.getElementById('historyBody').innerHTML =
       `<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">Ошибка: ${escHtml(e.message)}</td></tr>`;
@@ -2194,45 +2462,72 @@ async function loadHistory() {
 function renderHistory(docs) {
   const body = document.getElementById('historyBody');
   if (!docs||docs.length===0) { body.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:40px">История пуста</td></tr>'; return; }
-  body.innerHTML = docs.map(d=>`
-    <tr onclick="viewDoc(${d.id})" data-id="${d.id}">
-      <td class="id">#${d.id}</td>
+  body.innerHTML = docs.map(d=>{
+    const amount = d.status === 'done'
+      ? `${escHtml(String(d.total||'—'))} ${escHtml(d.currency||'')}`
+      : `<span style="color:${d.status==='failed'?'var(--red)':'var(--amber)'}" title="${escHtml(d.error||'')}">${PARSE_STATUS_LABEL[d.status]||escHtml(d.status)}</span>`;
+    return `
+    <tr data-id="${escHtml(d.id)}" title="ID разбора: ${escHtml(d.id)}">
+      <td class="id"><span class="hist-id">${escHtml(d.id)}</span><button class="copy-id-btn" title="Скопировать ID разбора" onclick="copyHistoryId(event, '${escHtml(d.id)}')">⎘ Скопировать</button></td>
       <td class="filename" title="${escHtml(d.filename)}">${escHtml(d.filename)}</td>
       <td class="date">${escHtml(d.date||'—')}</td>
-      <td class="amount">${escHtml(String(d.total||'—'))} ${escHtml(d.currency||'')}</td>
-      <td><span class="category-tag" style="font-size:10px">${escHtml(d.category||'прочее')}</span></td>
-    </tr>`).join('');
+      <td class="amount">${amount}</td>
+      <td>${d.status === 'done' ? `<span class="category-tag" style="font-size:10px">${escHtml(d.category||'прочее')}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+    </tr>`;
+  }).join('');
 }
 
 function filterHistory() {
   const q = document.getElementById('historySearch').value.toLowerCase();
   if (!q) { renderHistory(state.history); return; }
   renderHistory(state.history.filter(d=>
-    (d.filename||'').toLowerCase().includes(q)||(d.category||'').toLowerCase().includes(q)||String(d.total||'').includes(q)));
+    (d.id||'').includes(q)||(d.filename||'').toLowerCase().includes(q)||(d.category||'').toLowerCase().includes(q)||String(d.total||'').includes(q)));
 }
 
-async function viewDoc(id) {
+function copyHistoryId(event, id) {
+  event.stopPropagation();                    // не выделять строку и не открывать разбор
+  navigator.clipboard.writeText(id)
+    .then(() => showToast('ID скопирован: ' + id.slice(0, 8) + '…', 'success'))
+    .catch(() => showToast(id, 'info'));
+}
+
+function selectedHistoryId() {
+  const sel = document.querySelector('#historyBody tr.selected');
+  if (!sel) { showToast('Выберите строку', 'info'); return null; }
+  return sel.dataset.id;
+}
+
+function openSelected() {
+  const id = selectedHistoryId();
+  if (id) openParseById(id);
+}
+
+async function viewSelectedJson() {
+  const id = selectedHistoryId();
+  if (!id) return;
   try {
-    const r = await fetch('/api/document/'+id);
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    const data = await r.json();
-    document.getElementById('modalTitle').textContent = `Документ #${id} — ${data.filename||''}`;
-    document.getElementById('modalBody').textContent  = JSON.stringify(data.parsed, null, 2);
+    const v = await apiJson('/api/v1/parses/' + encodeURIComponent(id));
+    document.getElementById('modalTitle').textContent = `Разбор ${id} — ${v.filename||''}`;
+    document.getElementById('modalBody').textContent = JSON.stringify(v.result || v, null, 2);
     document.getElementById('modalOverlay').classList.add('open');
   } catch(e) { showToast('Ошибка: '+e.message, 'error'); }
 }
 
 async function deleteSelected() {
-  const sel = document.querySelector('#historyBody tr.selected');
-  if (!sel) { showToast('Выберите строку', 'info'); return; }
-  const id = sel.dataset.id;
-  if (!confirm(`Удалить документ #${id}?`)) return;
+  const id = selectedHistoryId();
+  if (!id) return;
+  if (!confirm(`Удалить разбор ${id}?`)) return;
   try {
-    const r = await fetch('/api/document/'+id, {method:'DELETE'});
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    showToast('Документ удалён', 'success'); loadHistory();
+    const r = await fetch('/api/v1/parses/'+encodeURIComponent(id), {method:'DELETE'});
+    if (!r.ok) { const body = await r.json().catch(()=>({})); throw new Error(apiErrorText(body, r.status)); }
+    showToast('Разбор удалён', 'success'); loadHistory();
   } catch(e) { showToast('Ошибка: '+e.message, 'error'); }
 }
+
+document.getElementById('historyBody').addEventListener('dblclick', e => {
+  if (e.target.closest('.copy-id-btn, .hist-id')) return;   // двойной щелчок по ID — это выделение, не открытие
+  const tr = e.target.closest('tr[data-id]'); if (tr) openParseById(tr.dataset.id);
+});
 
 document.getElementById('historyBody').addEventListener('click', e => {
   const tr = e.target.closest('tr[data-id]'); if (!tr) return;
@@ -2258,6 +2553,30 @@ function escHtml(s) {
 
 // Init
 updateButtons();
+checkParserHealth();
+
+// Доступность сервиса разбора — в панели «Конфигурация системы»
+async function checkParserHealth() {
+  const el = document.getElementById('parserHealth');
+  try {
+    const h = await apiJson('/api/v1/health');
+    const llmOk = h.llm && h.llm.reachable;
+    el.textContent = llmOk ? 'модель на связи' : 'модель недоступна';
+    el.style.color = llmOk ? 'var(--green)' : 'var(--amber)';
+    el.title = `Сервис разбора ${h.version}. ` + (llmOk
+      ? `Ollama: ${h.llm.url} · модели: ${(h.llm.models || []).join(', ')}`
+      : `Ollama не отвечает (${h.llm ? h.llm.url : '—'}): поля будут собраны только правилами`);
+  } catch (e) {
+    el.textContent = 'сервис недоступен';
+    el.style.color = 'var(--red)';
+    el.title = e.message;
+  }
+}
+{
+  // Страница, открытая с ?id=<ID разбора>, сразу показывает этот результат
+  const idFromUrl = new URLSearchParams(location.search).get('id');
+  if (idFromUrl) openParseById(idFromUrl.trim().toLowerCase());
+}
 </script>
 </body>
 </html>
