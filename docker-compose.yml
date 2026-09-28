@@ -1,34 +1,19 @@
-# ДокАнализ: сервис разбора + веб-интерфейс.
+# ДокАнализ: веб-интерфейс + сервис разбора.
 #
-#   mkdir -p data/parses           # один раз, до первого запуска
-#   docker compose up --build      # собрать и запустить
+# Сервис разбора живёт в отдельном репозитории dokanaliz-parser, который
+# должен лежать рядом с этим:
+#
+#   ~/document-classification-system   ← этот репозиторий (веб-интерфейс)
+#   ~/dokanaliz-parser                 ← сервис разбора
+#
+#   docker compose up --build      # собрать и запустить оба сервиса
 #   http://localhost:5000          # веб-интерфейс
 #   http://localhost:8000/api/v1   # API сервиса разбора
-#
-# Ollama в этот файл не входит: используется уже запущенный контейнер
-# ollama-server (порт 11434 на хосте). Если его нет, можно поднять
-# отсюда: docker compose --profile ollama up
+
+include:
+  - ../dokanaliz-parser/docker-compose.yml
 
 services:
-  # Сервис разбора: OCR, модель, правила, координаты. Независим от интерфейса.
-  parser:
-    build:
-      context: .
-      dockerfile: parser_service/Dockerfile
-    image: dokanaliz-parser
-    ports:
-      - "8000:8000"
-    environment:
-      - OLLAMA_HOST=http://host.docker.internal:11434
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    # Разборы лежат на хосте в ./data/parses/<ID>/ и переживают перезапуск.
-    # Контейнер работает от имени пользователя хоста — файлы результатов
-    # принадлежат ему, а не root, и их можно спокойно удалять.
-    user: "${UID:-1000}:${GID:-1000}"
-    volumes:
-      - ./data:/app/data
-
   # Веб-интерфейс: страница загрузки и просмотра. О разборе знает только API.
   web:
     build: ./web_client
@@ -39,14 +24,3 @@ services:
       - PARSER_URL=http://parser:8000
     depends_on:
       - parser
-
-  ollama:
-    image: ollama/ollama:latest
-    profiles: ["ollama"]
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-
-volumes:
-  ollama_data:

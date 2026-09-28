@@ -1,10 +1,15 @@
 import io
+import os
+import sys
 import unittest
 
 import requests
 
-from tests.helpers import ROOT  # noqa: F401  (настраивает пути)
-from web_client.server import create_app
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from web_client.server import create_app  # noqa: E402
 
 
 class FakeResponse:
