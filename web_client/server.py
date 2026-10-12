@@ -1,5 +1,12 @@
 """
-Сервер веб-интерфейса: отдаёт страницу и пересылает /api/v1/* в сервис разбора.
+Сервер веб-интерфейса: отдаёт две страницы и пересылает /api/v1/* в сервис разбора.
+
+Страницы разделены по назначению:
+  /parse (и /)       — запуск разбора: загрузка файлов, ID разбора, статус,
+                       история всех разборов;
+  /view?id=<ID>      — просмотр одного конкретного разбора с подсветкой.
+Связаны они только ID разбора: первая его выдаёт, вторая по нему открывает
+результат.
 
 Пересылка нужна, чтобы браузер ходил на один адрес: сервис разбора может
 жить где угодно (другой контейнер, другая машина), а страница об этом не
@@ -9,7 +16,7 @@
 import os
 
 import requests
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, redirect, request, send_from_directory
 
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
@@ -33,7 +40,23 @@ def create_app(parser_url, session=None):
 
     @app.get('/')
     def index():
-        return send_from_directory(STATIC_DIR, 'index.html')
+        # Ссылки старого вида /?id=<ID> (до разделения страниц) ведут в просмотр
+        if request.args.get('id'):
+            return redirect('/view?id=' + request.args['id'], code=302)
+        return send_from_directory(STATIC_DIR, 'parse.html')
+
+    @app.get('/parse')
+    def parse_page():
+        return send_from_directory(STATIC_DIR, 'parse.html')
+
+    @app.get('/view')
+    def view_page():
+        return send_from_directory(STATIC_DIR, 'view.html')
+
+    # Общие стили и скрипт обеих страниц
+    @app.get('/static/<path:name>')
+    def static_file(name):
+        return send_from_directory(STATIC_DIR, name)
 
     @app.route('/api/v1/<path:path>', methods=['GET', 'POST', 'DELETE'])
     def proxy(path):

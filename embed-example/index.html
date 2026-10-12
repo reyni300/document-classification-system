@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Просмотр разбора ДокАнализ во фрейме — пример</title>
+<!--
+  Пример внешней страницы, которая встраивает просмотр разбора ДокАнализ.
+
+  Это НЕ часть приложения: один файл, чистые HTML и JavaScript, без библиотек
+  и без кода ДокАнализа. Открывается прямо с диска (двойной щелчок) или с
+  любого сайта. Всё, что ему нужно знать, — адрес сервиса ДокАнализ и ID
+  разбора: просмотр (/view?id=<ID>) сам забирает результат и показывает его
+  во фрейме.
+
+  Встроить просмотр в свою страницу можно и без этого примера одной строкой:
+    <iframe src="http://localhost:5000/view?id=<ID разбора>"></iframe>
+-->
+<style>
+  :root {
+    --bg: #0f1117; --surface: #171b26; --card: #1e2333; --border: #2a3045;
+    --accent: #4f8ef7; --text: #e8ecf4; --muted: #7a85a3; --red: #f76f6f;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
+    background: var(--bg); color: var(--text); font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  }
+
+  .card { width: 560px; max-width: 100%; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; }
+  h1 { font-size: 18px; margin-bottom: 6px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+  input {
+    width: 100%; padding: 9px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--card); color: var(--text); font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; outline: none;
+  }
+  input:focus { border-color: var(--accent); }
+  .row { display: flex; gap: 8px; }
+  button, .btn {
+    padding: 9px 16px; border-radius: 8px; border: 1px solid var(--border); background: var(--card);
+    color: var(--text); font: 600 13px system-ui, sans-serif; cursor: pointer; text-decoration: none; white-space: nowrap;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .error { color: var(--red); font-size: 12px; min-height: 18px; margin-top: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  code { font-family: ui-monospace, monospace; font-size: 12px; color: var(--accent); }
+
+  /* Фрейм с просмотром — поверх страницы, вокруг видна сама страница */
+  .overlay {
+    display: none; position: fixed; inset: 0; z-index: 10; align-items: center; justify-content: center;
+    background: rgba(8,10,16,.55); backdrop-filter: blur(3px);
+  }
+  .overlay.open { display: flex; }
+  .frame-box {
+    width: 92vw; height: 92vh; display: flex; flex-direction: column; overflow: hidden;
+    background: var(--surface); border: 3px solid var(--accent); border-radius: 14px;
+    box-shadow: 0 24px 70px rgba(0,0,0,.7);
+  }
+  .frame-head {
+    display: flex; align-items: center; gap: 12px; padding: 9px 12px 9px 16px;
+    border-bottom: 2px solid var(--accent); background: var(--surface);
+  }
+  .frame-badge { background: var(--accent); color: #fff; border-radius: 6px; padding: 3px 9px; font-size: 11px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; }
+  .frame-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px ui-monospace, monospace; color: var(--muted); }
+  .frame-head button, .frame-head .btn { padding: 6px 12px; font-size: 12px; }
+  iframe { flex: 1; width: 100%; border: 0; background: #0b0d13; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>Просмотр разбора во фрейме</h1>
+
+  <div id="serviceBox">
+    <label for="service">Адрес сервиса ДокАнализ</label>
+    <input id="service" type="text" value="http://localhost:5000">
+    <div class="hint">Откуда брать просмотр. Если вставить ниже ссылку целиком, адрес возьмётся из неё.</div>
+  </div>
+
+  <label for="ref">ID разбора или ссылка</label>
+  <div class="row">
+    <input id="ref" type="text" placeholder="ID или http://localhost:5000/view?id=…" autofocus>
+    <button class="primary" id="openBtn">Открыть</button>
+  </div>
+  <div class="error" id="error"></div>
+  <div class="hint" id="srcHint">Во фрейм загружается <code>&lt;адрес сервиса&gt;/view?id=&lt;ID&gt;</code></div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="frame-box">
+    <div class="frame-head">
+      <span class="frame-badge">▣ Просмотр разбора</span>
+      <span class="frame-title" id="frameTitle"></span>
+      <a class="btn" id="newTab" href="#" target="_blank" rel="noopener">↗ В новой вкладке</a>
+      <button id="closeBtn" title="Закрыть (Esc)">✕ Закрыть</button>
+    </div>
+    <iframe id="frame" title="Просмотр разбора" src="about:blank" allow="clipboard-write"></iframe>
+  </div>
+</div>
+
+<script>
+  // Откуда брать просмотр.
+  //   false — у запущенного сервиса ДокАнализ: <адрес сервиса>/view?id=<ID>;
+  //   true  — из этой же папки: view.html?id=<ID>, который читает <ID>.json
+  //           рядом с собой. Так страница работает без сервиса, например на
+  //           GitHub Pages. Флаг включает tools/export_static.py.
+  var STATIC_DATA = false;
+
+  // ID разбора — 32 символа из цифр и букв a–f
+  var ID_RE = /[0-9a-f]{32}/i;
+  // ID блока: p1-b42 (итоговый JSON) или p1-r3, p1-r3-l2, p1-r3-l2-w5 (сырой)
+  var BLOCK_RE = /^p\d+-(?:b\d+|r\d+(?:-l\d+(?:-w\d+)?)?)$/i;
+  var params = new URLSearchParams(location.search);
+
+  var serviceInput = document.getElementById('service');
+  var refInput     = document.getElementById('ref');
+  var errorBox     = document.getElementById('error');
+  var overlay      = document.getElementById('overlay');
+  var frame        = document.getElementById('frame');
+
+  // Из того, что вставили, достаём ID и адрес сервиса.
+  // Ссылка (http://host:port/view?id=…) — адрес берём из неё,
+  // просто ID — адрес берём из поля «Адрес сервиса».
+  function parseRef(text) {
+    var match = String(text).match(ID_RE);
+    if (!match) return null;
+    var service = serviceInput.value.trim().replace(/\/+$/, '');
+    try {
+      var url = new URL(text.trim());
+      if (url.protocol === 'http:' || url.protocol === 'https:') service = url.origin;
+    } catch (e) { /* не ссылка — значит, просто ID */ }
+    // Ссылка на блок (…&block=p1-b42) — просмотр откроется сразу на нём
+    var block = null;
+    try { block = new URL(text.trim()).searchParams.get('block'); } catch (e) { /* просто ID */ }
+    if (!block && params.get('block') && refInput.value === params.get('id')) block = params.get('block');
+    if (block && !BLOCK_RE.test(block)) block = null;
+    return { id: match[0].toLowerCase(), service: service, block: block };
+  }
+
+  function openViewer() {
+    errorBox.textContent = '';
+    var ref = parseRef(refInput.value);
+    if (!ref) {
+      errorBox.textContent = 'Не похоже на ID разбора: нужно 32 символа из цифр и букв a–f (или ссылка с ним)';
+      return;
+    }
+    var src;
+    if (STATIC_DATA) {
+      src = 'view.html?id=' + encodeURIComponent(ref.id);       // разбор из этой папки
+      if (ref.block) src += '&block=' + encodeURIComponent(ref.block);
+      document.getElementById('frameTitle').textContent = 'ID ' + ref.id;
+    } else {
+      if (!/^https?:\/\//.test(ref.service)) {
+        errorBox.textContent = 'Укажите адрес сервиса, например http://localhost:5000';
+        return;
+      }
+      src = ref.service + '/view?id=' + encodeURIComponent(ref.id);
+      if (ref.block) src += '&block=' + encodeURIComponent(ref.block);
+      document.getElementById('frameTitle').textContent = ref.service + '  ·  ID ' + ref.id;
+    }
+    document.getElementById('newTab').href = src;
+    frame.src = src;
+    overlay.classList.add('open');
+  }
+
+  function closeViewer() {
+    overlay.classList.remove('open');
+    frame.src = 'about:blank';
+  }
+
+  document.getElementById('openBtn').addEventListener('click', openViewer);
+  document.getElementById('closeBtn').addEventListener('click', closeViewer);
+  refInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') openViewer(); });
+  overlay.addEventListener('click', function (e) { if (e.target === overlay) closeViewer(); });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && overlay.classList.contains('open')) closeViewer();
+  });
+  // Esc, нажатый внутри фрейма, просмотр присылает сообщением
+  window.addEventListener('message', function (e) {
+    if (e.source === frame.contentWindow && e.data && e.data.source === 'dokanaliz-view' && e.data.event === 'escape') {
+      closeViewer();
+    }
+  });
+
+  if (STATIC_DATA) {
+    // Сервис не нужен: поле адреса прячем, подсказку меняем
+    document.getElementById('serviceBox').style.display = 'none';
+    document.getElementById('srcHint').innerHTML =
+      'Разбор берётся из этой же папки: <code>&lt;ID&gt;.json</code> и картинки страниц';
+    refInput.placeholder = 'ID разбора или ссылка с ним';
+  }
+
+  // index.html?id=<ID или ссылка>&service=<адрес сервиса>&block=<ID блока> — сразу открыть
+  if (params.get('service')) serviceInput.value = params.get('service');
+  if (params.get('id')) { refInput.value = params.get('id'); openViewer(); }
+</script>
+</body>
+</html>

@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ДокАнализ — разбор документов</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+  /* ── Страница разбора: слева загрузка, справа запуски и история ── */
+  .parse-page {
+    display: grid; grid-template-columns: 320px 1fr;
+    flex: 1; min-height: 0; height: calc(100vh - 57px);
+  }
+  .side { background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
+  .side-body { padding: 14px; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; flex: 1; }
+  .content { display: flex; flex-direction: column; gap: 18px; padding: 18px 24px; overflow-y: auto; min-height: 0; }
+  .section-title { font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; display: flex; align-items: center; gap: 10px; }
+  .section-title .count { color: var(--accent); }
+
+  /* ── Загрузка и список выбранных файлов ── */
+  .upload-zone { border: 2px dashed var(--border); border-radius: 10px; padding: 20px 16px; text-align: center; cursor: pointer; transition: all .2s; background: var(--card); position: relative; }
+  .upload-zone:hover, .upload-zone.drag-over { border-color: var(--accent); background: rgba(79,142,247,.06); }
+  .upload-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .upload-icon { font-size: 26px; margin-bottom: 6px; }
+  .upload-text { color: var(--text); font-size: 13px; font-weight: 500; }
+  .upload-sub { color: var(--muted); font-size: 11px; margin-top: 3px; }
+
+  .file-list { display: flex; flex-direction: column; gap: 5px; }
+  .file-item { display: flex; align-items: center; gap: 8px; padding: 7px 9px; background: var(--card); border: 1px solid var(--border); border-radius: 7px; cursor: pointer; transition: border-color .15s; }
+  .file-item:hover { border-color: var(--accent); }
+  .file-item.active { border-color: var(--accent); background: rgba(79,142,247,.08); }
+  .file-thumb { width: 30px; height: 30px; border-radius: 4px; background: var(--border); overflow: hidden; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 13px; }
+  .file-thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .file-info { flex: 1; min-width: 0; }
+  .file-name { font-size: 11px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .file-meta { font-size: 10px; color: var(--muted); margin-top: 1px; }
+  .file-remove { width: 18px; height: 18px; border-radius: 3px; background: transparent; border: none; color: var(--muted); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0; transition: all .15s; }
+  .file-remove:hover { background: rgba(247,111,111,.15); color: var(--red); }
+  .file-size { font-size: 10px; color: var(--muted); }
+
+  .tech-block { background: var(--card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .tech-block-title { padding: 7px 12px; font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .tech-rows { padding: 6px 0; }
+  .tech-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 12px; font-size: 11px; }
+  .tech-row .k { color: var(--muted); }
+  .tech-row .v { color: var(--text); font-family: var(--mono); font-weight: 500; }
+  .tech-row .v.green { color: var(--green); }
+  .tech-row .v.blue  { color: var(--accent); }
+
+  /* ── Таблицы запусков и истории ── */
+  .history-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .history-toolbar .btn { width: auto; padding: 7px 12px; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th { padding: 9px 13px; text-align: left; font-family: var(--mono); font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 1; }
+  tbody tr { border-bottom: 1px solid rgba(42,48,69,.6); transition: background .12s; cursor: pointer; }
+  tbody tr:hover { background: var(--card); }
+  tbody tr.selected { background: rgba(79,142,247,.08); }
+  tbody td { padding: 9px 13px; color: var(--text); }
+  tbody td.id { font-family: var(--mono); color: var(--muted); white-space: nowrap; }
+  .hist-id { user-select: all; font-size: 12px; }
+  .copy-id-btn { margin-left: 8px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--card); color: var(--text); font-size: 11px; cursor: pointer; transition: all .15s; }
+  .copy-id-btn:hover { border-color: var(--accent); color: var(--accent); }
+  tbody td.filename { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  tbody td.date { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  tbody td.amount { font-family: var(--mono); font-weight: 600; color: var(--accent); }
+  tbody tr { cursor: default; }
+  .status-cell { white-space: nowrap; font-size: 12px; }
+  .status-cell.queued, .status-cell.processing { color: var(--amber); }
+  .status-cell.done { color: var(--green); }
+  .status-cell.failed { color: var(--red); }
+  .summary-cell { font-size: 12px; color: var(--muted); }
+  .row-actions { display: flex; gap: 6px; justify-content: flex-end; white-space: nowrap; }
+  .row-actions .btn, .row-actions a.btn { width: auto; padding: 4px 10px; font-size: 11px; font-weight: 500; text-decoration: none; }
+  .row-actions .btn:disabled { visibility: hidden; }
+  .empty-row td { text-align: center; color: var(--muted); padding: 30px; }
+  .category-tag { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: 20px; font-size: 10px; font-weight: 600; background: rgba(79,142,247,.12); color: var(--accent); border: 1px solid rgba(79,142,247,.2); text-transform: uppercase; letter-spacing: .5px; }
+
+  /* ── Просмотр разбора во фрейме поверх страницы ──
+     Фрейм заметно меньше экрана: вокруг видна размытая страница разбора, так
+     что сразу понятно — это вложенное окно, а не переход на другую страницу. */
+  .viewer-overlay {
+    display: none; position: fixed; inset: 0; z-index: 250;
+    align-items: center; justify-content: center;
+    background: rgba(8,10,16,.55);
+    backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  }
+  .viewer-overlay.open { display: flex; animation: viewerIn .16s ease; }
+  @keyframes viewerIn { from { opacity: 0; transform: scale(.985); } to { opacity: 1; transform: none; } }
+  .viewer {
+    width: 92vw; height: 92vh; display: flex; flex-direction: column;
+    background: var(--surface);
+    border: 3px solid var(--accent); border-radius: 14px; overflow: hidden;
+    box-shadow: 0 0 0 1px rgba(79,142,247,.35), 0 24px 70px rgba(0,0,0,.7), 0 0 40px rgba(79,142,247,.25);
+  }
+  .viewer-header {
+    display: flex; align-items: center; gap: 12px; padding: 9px 12px 9px 16px; flex-shrink: 0;
+    background: linear-gradient(90deg, rgba(79,142,247,.28), rgba(124,92,252,.18)), var(--surface);
+    border-bottom: 2px solid var(--accent);
+  }
+  .viewer-badge {
+    flex-shrink: 0; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .8px;
+    text-transform: uppercase; color: #fff; background: var(--accent); border-radius: 6px; padding: 4px 9px;
+  }
+  .viewer-title { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 10px; white-space: nowrap; overflow: hidden; }
+  .viewer-title .name { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
+  .viewer-title .id { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+  .viewer-header .btn { width: auto; padding: 6px 12px; font-size: 12px; text-decoration: none; }
+  .viewer-close { background: rgba(247,111,111,.12); border: 1px solid rgba(247,111,111,.4); color: #ffb4b4; }
+  .viewer-close:hover:not(:disabled) { background: rgba(247,111,111,.22); color: #fff; }
+  /* Внутри фрейма — свой, чуть другой фон, чтобы граница фрейма читалась */
+  .viewer iframe { flex: 1; width: 100%; border: none; background: #0b0d13; }
+
+  /* ── «Просмотр»: вставить ID или ссылку — разбор откроется во фрейме ── */
+  .id-dialog { width: 520px; max-width: calc(100vw - 32px); background: var(--surface); border: 2px solid var(--accent);
+               border-radius: 12px; overflow: hidden; box-shadow: 0 24px 70px rgba(0,0,0,.7); }
+  .id-dialog .viewer-header { border-bottom-width: 1px; }
+  .id-dialog-body { padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .id-dialog-row { display: flex; gap: 8px; }
+  .id-dialog-row .search-input { font-family: var(--mono); font-size: 12px; }
+  .id-dialog-row .btn { width: auto; padding: 7px 16px; }
+  .id-dialog-hint { font-size: 11px; color: var(--muted); }
+  .id-dialog-error { font-size: 12px; color: var(--red); min-height: 16px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">📄</div>
+    ДокАнализ <span>/ финансовые документы</span>
+  </div>
+  <nav class="page-nav">
+    <a class="active" href="/parse">Разбор</a>
+    <a href="/view" onclick="return openIdDialog(event)" title="Открыть разбор по ID или ссылке — во фрейме">Просмотр</a>
+  </nav>
+  <div id="globalStatus" class="status-chip idle">
+    <div class="status-dot"></div><span>Готов</span>
+  </div>
+</header>
+
+<main class="parse-page">
+  <!-- Слева: какие файлы отправить на разбор -->
+  <div class="side">
+    <div class="panel-header">
+      <span class="panel-title">Новый разбор</span>
+      <span class="panel-badge" id="fileCountBadge">0 файлов</span>
+    </div>
+    <div class="side-body">
+      <div class="upload-zone" id="uploadZone">
+        <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.pdf" multiple>
+        <div class="upload-icon">📂</div>
+        <div class="upload-text">Перетащите файлы сюда</div>
+        <div class="upload-sub">PNG, JPG, PDF · несколько файлов</div>
+      </div>
+      <div class="file-list" id="fileList"></div>
+      <button class="btn btn-primary" id="btnParse" onclick="startParsing()" disabled>▶ Запустить разбор</button>
+      <button class="btn btn-secondary" id="btnClear" onclick="clearFiles()" disabled>Очистить список</button>
+      <div class="separator"></div>
+
+      <div class="tech-block">
+        <div class="tech-block-title">Конфигурация системы</div>
+        <div class="tech-rows">
+          <div class="tech-row"><span class="k">OCR движок</span><span class="v blue">Tesseract</span></div>
+          <div class="tech-row"><span class="k">Язык OCR</span><span class="v">rus + eng</span></div>
+          <div class="tech-row"><span class="k">LLM модель</span><span class="v blue">Mistral (Ollama)</span></div>
+          <div class="tech-row"><span class="k">Перевод</span><span class="v green">Включён</span></div>
+          <div class="tech-row"><span class="k">Валидация</span><span class="v green">Включена</span></div>
+          <div class="tech-row"><span class="k">Разбор</span><span class="v" id="parserHealth" title="Отдельный сервис разбора, API /api/v1">сервис · проверка…</span></div>
+          <div class="tech-row"><span class="k">Хранение</span><span class="v">по ID разбора</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Справа: что отправлено сейчас и все прошлые разборы -->
+  <div class="content">
+    <section id="runsSection" style="display:none">
+      <div class="section-title">Запуски <span class="count" id="runsCount"></span></div>
+      <table>
+        <thead><tr><th>Файл</th><th>ID разбора</th><th>Статус</th><th>Итог</th><th></th></tr></thead>
+        <tbody id="runsBody"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <div class="section-title">История разборов</div>
+      <div class="history-toolbar">
+        <input class="search-input" type="text" id="historySearch" placeholder="Поиск по ID, файлу, категории, сумме..." oninput="renderHistory()">
+        <button class="btn btn-secondary" onclick="loadHistory()">↺ Обновить</button>
+      </div>
+      <table>
+        <thead><tr><th>ID разбора</th><th>Файл</th><th>Дата</th><th>Сумма</th><th>Категория</th><th></th></tr></thead>
+        <tbody id="historyBody">
+          <tr class="empty-row"><td colspan="6">Загрузка…</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+</main>
+
+<!-- Окно с JSON разбора -->
+<div class="modal-overlay" id="modalOverlay" onclick="closeModalOutside(event)">
+  <div class="modal">
+    <div class="modal-header">
+      <span class="modal-title" id="modalTitle">JSON</span>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeModal()" style="width:auto;padding:7px 18px">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<!-- Просмотр одного разбора: атомарная страница /view?id=<ID> во фрейме -->
+<div class="viewer-overlay" id="viewerOverlay" onclick="if (event.target === this) closeViewer()">
+  <div class="viewer">
+    <div class="viewer-header">
+      <span class="viewer-badge">▣ Просмотр разбора</span>
+      <span class="viewer-title" id="viewerTitle"></span>
+      <a class="btn btn-secondary" id="viewerNewTab" href="#" target="_blank" rel="noopener" title="Открыть этот просмотр отдельной вкладкой">↗ В новой вкладке</a>
+      <button class="btn viewer-close" onclick="closeViewer()" title="Закрыть (Esc)">✕ Закрыть</button>
+    </div>
+    <iframe id="viewerFrame" title="Просмотр разбора" src="about:blank" allow="clipboard-write"></iframe>
+  </div>
+</div>
+
+<!-- «Просмотр»: ID или ссылка на разбор -> просмотр во фрейме -->
+<div class="viewer-overlay" id="idDialogOverlay" onclick="if (event.target === this) closeIdDialog()">
+  <div class="id-dialog">
+    <div class="viewer-header">
+      <span class="viewer-badge">▣ Просмотр разбора</span>
+      <span class="viewer-title"><span class="name">Открыть по ID или ссылке</span></span>
+      <button class="btn viewer-close" onclick="closeIdDialog()" title="Закрыть (Esc)">✕</button>
+    </div>
+    <div class="id-dialog-body">
+      <div class="id-dialog-row">
+        <input class="search-input" type="text" id="idDialogInput" placeholder="ID разбора или ссылка /view?id=…"
+               onkeydown="if (event.key === 'Enter') openFromDialog()">
+        <button class="btn btn-primary" onclick="openFromDialog()">Открыть</button>
+      </div>
+      <div class="id-dialog-error" id="idDialogError"></div>
+      <div class="id-dialog-hint">Разбор откроется во фрейме поверх этой страницы. Подойдёт сам ID (32 символа) или любая ссылка, в которой он есть.</div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="/static/common.js"></script>
+<script>
+// ════════════════════════════════════════════════
+// СТРАНИЦА РАЗБОРА
+// Отправляет файлы в сервис разбора и показывает, что с ними: ID разбора,
+// статус, ссылку на просмотр. Сам документ здесь не показывается — для этого
+// страница просмотра (/view?id=<ID>), одна на каждый разбор.
+// ════════════════════════════════════════════════
+const state = {
+  files: [],        // выбранные, ещё не отправленные: { file, name, size }
+  runs: [],         // отправленные в этой вкладке: { name, id, status, view, error }
+  history: [],      // все разборы сервиса (GET /api/v1/parses)
+};
+
+// ── Выбор файлов ─────────────────────────────────
+const fileInput  = document.getElementById('fileInput');
+const uploadZone = document.getElementById('uploadZone');
+fileInput.addEventListener('change', e => { addFiles(e.target.files); fileInput.value = ''; });
+uploadZone.addEventListener('dragover',  e => { e.preventDefault(); uploadZone.classList.add('drag-over'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag-over'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault(); uploadZone.classList.remove('drag-over'); addFiles(e.dataTransfer.files);
+});
+
+function addFiles(fileList) {
+  for (const file of fileList) {
+    if (!/\.(png|jpe?g|pdf)$/i.test(file.name)) {
+      showToast('Неподдерживаемый формат: ' + file.name, 'error'); continue;
+    }
+    state.files.push({ file, name: file.name, size: file.size });
+  }
+  renderFiles();
+}
+
+function removeFile(idx) {
+  state.files.splice(idx, 1);
+  renderFiles();
+}
+
+function clearFiles() {
+  state.files = [];
+  renderFiles();
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' Б';
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' КБ';
+  return (bytes / 1024 / 1024).toFixed(1) + ' МБ';
+}
+
+function renderFiles() {
+  document.getElementById('fileList').innerHTML = state.files.map((f, i) => `
+    <div class="file-item">
+      <div class="file-thumb">${/\.pdf$/i.test(f.name) ? '📄' : '🖼'}</div>
+      <div class="file-info">
+        <div class="file-name" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
+        <div class="file-size">${formatSize(f.size)}</div>
+      </div>
+      <button class="file-remove" title="Убрать из списка" onclick="removeFile(${i})">×</button>
+    </div>`).join('');
+  document.getElementById('fileCountBadge').textContent = state.files.length + ' файлов';
+  document.getElementById('btnParse').disabled = state.files.length === 0;
+  document.getElementById('btnClear').disabled = state.files.length === 0;
+}
+
+// ── Запуск разбора ───────────────────────────────
+// Все выбранные файлы уходят в сервис сразу: каждый получает ID, а очередь
+// ведёт сам сервис (документы разбираются строго по одному). Дальше статус
+// каждого опрашивается отдельно, пока разбор не закончится.
+async function startParsing() {
+  const files = state.files;
+  if (!files.length) return;
+  state.files = [];
+  renderFiles();
+  setStatus('processing', 'Отправка...');
+
+  const waits = [], mine = [];
+  for (const f of files) {
+    const run = { name: f.name, id: null, status: 'sending', view: null, error: null };
+    state.runs.unshift(run);
+    mine.push(run);
+    renderRuns();
+    try {
+      const form = new FormData();
+      form.append('file', f.file, f.name);
+      const created = await apiJson('/api/v1/parses', { method: 'POST', body: form });
+      run.id = created.id;
+      run.view = created;
+      run.status = created.status;
+      renderRuns();
+      waits.push(follow(run));
+    } catch (e) {
+      run.status = 'failed';
+      run.error = e.message;
+      renderRuns();
+    }
+  }
+  setStatus('processing', 'Идёт разбор...');
+  await Promise.all(waits);
+  const failed = mine.filter(r => r.status === 'failed').length;
+  setStatus(failed ? 'error' : 'done', failed ? 'Есть ошибки' : 'Готово');
+  loadHistory();
+}
+
+async function follow(run) {
+  try {
+    run.view = await waitForParse(run.id, v => { run.view = v; run.status = v.status; renderRuns(); });
+    run.status = 'done';
+  } catch (e) {
+    run.status = 'failed';
+    run.error = e.message;
+  }
+  renderRuns();
+}
+
+function runSummary(run) {
+  if (run.status === 'failed') return `<span style="color:var(--red)">${escHtml(run.error || 'ошибка')}</span>`;
+  const s = run.view && run.view.summary;
+  if (run.status !== 'done' || !s) return '—';
+  const parts = [s.document_type, `полей ${s.fields}`];
+  if (s.total) parts.push(`сумма ${s.total}${s.currency ? ' ' + s.currency : ''}`);
+  return escHtml(parts.filter(Boolean).join(' · '));
+}
+
+function renderRuns() {
+  document.getElementById('runsSection').style.display = state.runs.length ? '' : 'none';
+  document.getElementById('runsCount').textContent = state.runs.length || '';
+  document.getElementById('runsBody').innerHTML = state.runs.map((r, i) => {
+    const status = r.status === 'sending' ? 'отправка…' : parseStatusText(r.view && r.status !== 'failed' ? r.view : r);
+    const rawReady = r.view && r.view.raw_ready;
+    return `
+    <tr>
+      <td class="filename" title="${escHtml(r.name)}">${escHtml(r.name)}</td>
+      <td class="id">${r.id ? `<span class="hist-id">${escHtml(r.id)}</span><button class="copy-id-btn" onclick="copyText('${r.id}', 'ID скопирован')">⎘</button>` : '—'}</td>
+      <td class="status-cell ${escHtml(r.status)}">${escHtml(status)}</td>
+      <td class="summary-cell">${runSummary(r)}</td>
+      <td><div class="row-actions">
+        ${r.id ? `<a class="btn btn-primary" href="${viewLink(r.id)}" onclick="return openViewer(event, '${r.id}', state.runs[${i}].name)"
+                   title="Открыть результат с подсветкой (откроется, когда разбор закончится)">▣ Просмотр</a>` : ''}
+        <button class="btn btn-secondary" ${rawReady ? '' : 'disabled'} onclick="downloadRawJson('${r.id}', state.runs[${i}].name)"
+                title="Что распознал OCR, до обработки — доступен сразу после распознавания">⬇ Сырой JSON</button>
+        <button class="btn btn-secondary" ${r.status === 'done' ? '' : 'disabled'} onclick="downloadResultJson('${r.id}', state.runs[${i}].name)">⬇ JSON</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── История разборов ─────────────────────────────
+async function loadHistory() {
+  try {
+    const data = await apiJson('/api/v1/parses?limit=200');
+    state.history = data.items || [];
+    renderHistory();
+  } catch (e) {
+    document.getElementById('historyBody').innerHTML =
+      `<tr class="empty-row"><td colspan="6">Ошибка: ${escHtml(e.message)}</td></tr>`;
+  }
+}
+
+function historyMatches(it, q) {
+  const s = it.summary || {};
+  return !q || [it.id, it.filename, s.category, s.total, s.document_type]
+    .some(v => String(v || '').toLowerCase().includes(q));
+}
+
+function renderHistory() {
+  const q = document.getElementById('historySearch').value.trim().toLowerCase();
+  const items = state.history.filter(it => historyMatches(it, q));
+  const body = document.getElementById('historyBody');
+  if (!items.length) {
+    body.innerHTML = `<tr class="empty-row"><td colspan="6">${state.history.length ? 'Ничего не найдено' : 'История пуста'}</td></tr>`;
+    return;
+  }
+  body.innerHTML = items.map(it => {
+    const s = it.summary || {};
+    const done = it.status === 'done';
+    const amount = done ? `${escHtml(String(s.total || '—'))} ${escHtml(s.currency || '')}`
+      : `<span class="status-cell ${escHtml(it.status)}" title="${escHtml(it.error || '')}">${escHtml(parseStatusText(it))}</span>`;
+    return `
+    <tr data-id="${escHtml(it.id)}">
+      <td class="id"><span class="hist-id">${escHtml(it.id)}</span><button class="copy-id-btn" onclick="copyText('${escHtml(it.id)}', 'ID скопирован')">⎘</button></td>
+      <td class="filename" title="${escHtml(it.filename || '')}">${escHtml(it.filename || '')}</td>
+      <td class="date">${escHtml((it.created_at || '').slice(0, 10) || '—')}</td>
+      <td class="amount">${amount}</td>
+      <td>${done ? `<span class="category-tag">${escHtml(s.category || 'прочее')}</span>` : '<span style="color:var(--muted)">—</span>'}</td>
+      <td><div class="row-actions">
+        <a class="btn btn-primary" href="${viewLink(it.id)}" onclick="return openViewer(event, '${escHtml(it.id)}', state.history.find(h => h.id === '${escHtml(it.id)}').filename)" title="Открыть результат с подсветкой">▣ Просмотр</a>
+        <button class="btn btn-secondary" onclick="showParseJson('${escHtml(it.id)}')" title="Результат разбора в JSON">{ } JSON</button>
+        <button class="btn btn-secondary" onclick="downloadRawJson('${escHtml(it.id)}')" title="Что распознал OCR, до обработки">⬇ Сырой</button>
+        <button class="btn btn-danger" onclick="deleteParse('${escHtml(it.id)}')" title="Удалить разбор">✕</button>
+      </div></td>
+    </tr>`;
+  }).join('');
+}
+
+async function showParseJson(id) {
+  try {
+    const v = await apiJson('/api/v1/parses/' + encodeURIComponent(id));
+    openModal(`Разбор ${id} — ${v.filename || ''}`, JSON.stringify(v.result || v, null, 2));
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+async function deleteParse(id) {
+  if (!confirm(`Удалить разбор ${id}?`)) return;
+  try {
+    const r = await fetch('/api/v1/parses/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (!r.ok) { const body = await r.json().catch(() => ({})); throw new Error(apiErrorText(body, r.status)); }
+    showToast('Разбор удалён', 'success');
+    loadHistory();
+  } catch (e) { showToast('Ошибка: ' + e.message, 'error'); }
+}
+
+// Двойной щелчок по строке истории — открыть разбор в просмотре
+document.getElementById('historyBody').addEventListener('dblclick', e => {
+  if (e.target.closest('button, a, .hist-id')) return;
+  const tr = e.target.closest('tr[data-id]');
+  if (tr) openViewer(null, tr.dataset.id, (state.history.find(h => h.id === tr.dataset.id) || {}).filename);
+});
+
+// ── Просмотр во фрейме ───────────────────────────
+// Просмотр — отдельная атомарная страница (/view?id=<ID>): ей нужен только ID,
+// результат она забирает у сервиса сама. Здесь она открывается во фрейме
+// поверх страницы разбора: закрыл — и ты снова в списке, ничего не сбилось.
+// Щелчок средней кнопкой или с Ctrl по «Просмотр» открывает её в новой вкладке.
+function openViewer(event, id, filename, block) {
+  if (event && (event.ctrlKey || event.metaKey || event.shiftKey || event.button === 1)) return true;
+  if (event) event.preventDefault();
+  document.getElementById('viewerTitle').innerHTML =
+    `<span class="name">${escHtml(filename || 'Разбор')}</span><span class="id">ID ${escHtml(id)}</span>`;
+  // Ссылка на блок (…&block=p1-b42) — просмотр откроется сразу на этом блоке
+  document.getElementById('viewerNewTab').href = viewLinkWithBlock(id, block);
+  document.getElementById('viewerFrame').src = viewLinkWithBlock(id, block);
+  document.getElementById('viewerOverlay').classList.add('open');
+  return false;
+}
+
+// ── «Просмотр» в шапке: вставить ID или ссылку ────
+function openIdDialog(event) {
+  if (event && (event.ctrlKey || event.metaKey || event.shiftKey || event.button === 1)) return true;
+  if (event) event.preventDefault();
+  const input = document.getElementById('idDialogInput');
+  input.value = '';
+  document.getElementById('idDialogError').textContent = '';
+  document.getElementById('idDialogOverlay').classList.add('open');
+  setTimeout(() => input.focus(), 0);
+  return false;
+}
+
+function closeIdDialog() {
+  document.getElementById('idDialogOverlay').classList.remove('open');
+}
+
+function openFromDialog() {
+  const text = document.getElementById('idDialogInput').value;
+  const id = extractParseId(text);
+  if (!id) {
+    document.getElementById('idDialogError').textContent =
+      'Не похоже на ID разбора: нужно 32 символа из цифр и букв a–f (или ссылка с ним)';
+    return;
+  }
+  closeIdDialog();
+  showViewerFor(id, extractBlockId(text));
+}
+
+// Открыть разбор во фрейме по одному ID: имя файла берём из истории, а если
+// его там нет — спрашиваем у сервиса (просмотр внутри фрейма сам скажет,
+// если такого разбора нет).
+function showViewerFor(id, block) {
+  const known = state.history.find(h => h.id === id);
+  openViewer(null, id, known ? known.filename : 'Разбор', block);
+  if (!known) {
+    apiJson('/api/v1/parses/' + encodeURIComponent(id))
+      .then(v => { if (v.filename) document.querySelector('#viewerTitle .name').textContent = v.filename; })
+      .catch(() => {});
+  }
+}
+
+function closeViewer() {
+  document.getElementById('viewerOverlay').classList.remove('open');
+  document.getElementById('viewerFrame').src = 'about:blank';     // остановить опрос статуса внутри
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (document.getElementById('idDialogOverlay').classList.contains('open')) closeIdDialog();
+  else if (document.getElementById('viewerOverlay').classList.contains('open')) closeViewer();
+});
+// Esc, нажатый внутри фрейма, просмотр присылает сообщением
+window.addEventListener('message', e => {
+  if (e.source === document.getElementById('viewerFrame').contentWindow
+      && e.data && e.data.source === 'dokanaliz-view' && e.data.event === 'escape') closeViewer();
+});
+
+// ── Доступность сервиса разбора и модели ─────────
+async function checkParserHealth() {
+  const el = document.getElementById('parserHealth');
+  try {
+    const h = await apiJson('/api/v1/health');
+    const llmOk = h.llm && h.llm.reachable;
+    el.textContent = llmOk ? 'модель на связи' : 'модель недоступна';
+    el.style.color = llmOk ? 'var(--green)' : 'var(--amber)';
+    el.title = `Сервис разбора ${h.version}. ` + (llmOk
+      ? `Ollama: ${h.llm.url} · модели: ${(h.llm.models || []).join(', ')}`
+      : `Ollama не отвечает (${h.llm ? h.llm.url : '—'}): поля будут собраны только правилами`);
+  } catch (e) {
+    el.textContent = 'сервис недоступен';
+    el.style.color = 'var(--red)';
+    el.title = e.message;
+  }
+}
+
+renderFiles();
+checkParserHealth();
+loadHistory();
+// /parse?open=<ID или ссылка> — сразу открыть этот разбор во фрейме
+{
+  const params = new URLSearchParams(location.search);
+  const id = extractParseId(params.get('open'));
+  if (id) showViewerFor(id, extractBlockId(params.get('block') || params.get('open')));
+}
+</script>
+</body>
+</html>
