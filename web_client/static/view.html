@@ -333,8 +333,8 @@
           <div class="parse-bar-actions">
             <span class="block-pin" id="blockPin">
               <span class="block-pin-id" id="blockPinId" title="ID закреплённого блока"></span>
-              <button class="btn btn-secondary" onclick="copyBlockLink()" title="Ссылка, по которой откроется этот разбор с выделенным блоком">🔗 Ссылка на блок</button>
-              <button class="btn btn-secondary" onclick="unpinBlock()" title="Снять выделение (Esc)">✕</button>
+              <button class="btn btn-secondary" id="blockLinkBtn" onclick="copyBlockLink()" title="Ссылка, по которой откроется этот разбор с выделенным блоком или словом. Щёлкните по закреплённому блоку ещё раз, чтобы выбрать в нём слово">🔗 Ссылка на блок</button>
+              <button class="btn btn-secondary" onclick="unpinStep()" title="Снять выделение (Esc): сначала слово, потом блок">✕</button>
             </span>
             <button class="btn btn-primary" onclick="copyParseLink()">⎘ Ссылка на результат</button>
           </div>
@@ -1352,7 +1352,7 @@ function rebuildOcrHitLayer() {
       div.dataset.seg = seg.id;
       div.addEventListener('mouseenter', () => onSegmentEnter(side.side, seg.id));
       div.addEventListener('mouseleave', () => onSegmentLeave());
-      div.addEventListener('click', () => togglePinSegment(side.pd, seg.id));
+      div.addEventListener('click', e => togglePinSegment(side.pd, seg.id, e));
       side.layer.appendChild(div);
     });
     side.mapping = null;          // по полям зоны уже не нужны
@@ -1892,6 +1892,7 @@ function drawSegmentsLayer(ctx, pd, links, solid, side) {
   const shown = segs.length ? pd.segments : pd.segments.filter(seg => isPinnedSeg(pd, seg));
   shown.forEach(seg => { if (active.has(seg.id)) drawSegmentBlock(ctx, seg, solid, true); });
   if (dim && state.pinned.raw) drawPinnedRaw(ctx, state.pinned.raw);
+  if (dim && state.pinned.word) drawPinnedRaw(ctx, state.pinned.word);   // выбранное слово блока
 }
 
 // ── Строка текста над документом ───────────────────────────────
@@ -2078,10 +2079,57 @@ function relatedForSegment(pd, seg) {
 // тогда над документом появляется кнопка «Ссылка на блок».
 // ════════════════════════════════════════════════
 
-// state.pinned: null | { page, blockId, segId, segIds, raw: null | { id, bbox, text } }
+// state.pinned: null | { page, blockId, segId, segIds, raw: null | { id, bbox, text },
+//                        word: null | { id, bbox, text } }
+// Первый щелчок по блоку закрепляет блок, второй — слово внутри него.
 state.pinned = null;
 
 const BLOCK_RE = /^p(\d+)-b(\d+)$/;
+const WORD_RE = /^p(\d+)-b(\d+)-w(\d+)$/;
+
+// Слова блока с их ID (p1-b42-w1, p1-b42-w2, …) — из строк текста страницы.
+// У разбора без ID слов (выгружен раньше) ID считаются так же, как в сервисе.
+function segWords(pd, seg) {
+  if (!pd || !seg) return [];
+  if (!pd._words) {
+    pd._words = {};                                   // block_id -> слова
+    const byBox = {};
+    pd.segments.forEach(s => { const k = boxKey(s.bbox); if (!(k in byBox)) byBox[k] = s; });
+    (pd.lines || []).forEach(line => (line.blocks || []).forEach(b => {
+      const own = byBox[boxKey(b.bbox)];
+      if (!own) return;
+      const bid = b.block_id || segBlockId(pd, own);
+      pd._words[bid] = (b.words || []).map((w, i) => ({
+        id: w.id || `${bid}-w${i + 1}`, text: w.text, bbox: { x: w.x, y: w.y, w: w.w, h: w.h } }));
+    }));
+  }
+  const bid = segBlockId(pd, seg);
+  if (pd._words[bid]) return pd._words[bid];
+  // Значение внутри более широкого блока той же строки — слова хозяина
+  const host = pd.segments.find(s => s !== seg && pd._words[segBlockId(pd, s)] && centerInside(seg.bbox, s.bbox));
+  return host ? pd._words[segBlockId(pd, host)].filter(w => centerInside(w.bbox, seg.bbox)) : [];
+}
+function boxKey(b) { return [b.x, b.y, b.w, b.h].join(','); }
+
+// Слово блока под курсором: точка щелчка -> координаты листа
+function wordAt(pd, seg, event) {
+  const layer = event.currentTarget && event.currentTarget.parentElement;
+  if (!layer) return null;
+  const r = layer.getBoundingClientRect();
+  const x = (event.clientX - r.left) * state.imgNaturalW / r.width;
+  const y = (event.clientY - r.top) * state.imgNaturalH / r.height;
+  const words = segWords(pd, seg);
+  const inside = words.find(w => x >= w.bbox.x - 3 && x <= w.bbox.x + w.bbox.w + 3
+                                && y >= w.bbox.y - 3 && y <= w.bbox.y + w.bbox.h + 3);
+  if (inside) return inside;
+  // между словами — ближайшее по горизонтали
+  let best = null, dist = Infinity;
+  words.forEach(w => {
+    const d = Math.abs(x - (w.bbox.x + w.bbox.w / 2));
+    if (d < dist) { dist = d; best = w; }
+  });
+  return best;
+}
 const RAW_BLOCK_RE = /^p(\d+)-r\d+(?:-l\d+(?:-w\d+)?)?$/;
 
 // ID блока; у разбора, выгруженного до появления ID, — тот же по номеру
@@ -2089,15 +2137,25 @@ function segBlockId(pd, seg) { return seg.block_id || `p${pd.number}-b${seg.id}`
 function pinnedOn(pd) { return !!(state.pinned && pd && pd.number === state.pinned.page); }
 function isPinnedSeg(pd, seg) { return pinnedOn(pd) && state.pinned.segIds.includes(seg.id); }
 
-function togglePinSegment(pd, segId) {
+// Щелчок по блоку: блок не закреплён — закрепить блок; закреплён — выбрать
+// слово под курсором; щелчок по уже выбранному слову — снова весь блок.
+function togglePinSegment(pd, segId, event) {
   const seg = pd && pd.segments[segId];
   if (!seg) return;
-  if (pinnedOn(pd) && !state.pinned.raw && state.pinned.segId === segId) { unpinBlock(); return; }
-  pinSegment(pd, seg);
+  const sameBlock = pinnedOn(pd) && !state.pinned.raw && state.pinned.segId === segId;
+  if (!sameBlock) { pinSegment(pd, seg); return; }
+  const word = event ? wordAt(pd, seg, event) : null;
+  if (!word || (state.pinned.word && state.pinned.word.id === word.id)) {
+    state.pinned.word = null;                       // назад к блоку целиком
+  } else {
+    state.pinned.word = word;
+  }
+  renderBlockPin(); focusPinned(); redrawCanvas(); redrawAnnotation();
 }
 
-function pinSegment(pd, seg) {
-  state.pinned = { page: pd.number, blockId: segBlockId(pd, seg), segId: seg.id, segIds: [seg.id], raw: null };
+function pinSegment(pd, seg, word) {
+  state.pinned = { page: pd.number, blockId: segBlockId(pd, seg), segId: seg.id, segIds: [seg.id],
+                   raw: null, word: word || null };
   renderBlockPin(); focusPinned(); redrawCanvas(); redrawAnnotation();
 }
 
@@ -2107,17 +2165,40 @@ function unpinBlock() {
   renderBlockPin(); setFocus('', ''); redrawCanvas(); redrawAnnotation();
 }
 
+// Esc и ✕: сначала снимают выбранное слово, потом блок
+function unpinStep() {
+  if (state.pinned && state.pinned.word) {
+    state.pinned.word = null;
+    renderBlockPin(); focusPinned(); redrawCanvas(); redrawAnnotation();
+  } else {
+    unpinBlock();
+  }
+}
+
+// ID того, на что ведёт ссылка: выбранное слово или весь блок
+function pinnedRef() {
+  const p = state.pinned;
+  return p ? (p.word ? p.word.id : p.blockId) : '';
+}
+
 function renderBlockPin() {
   const box = document.getElementById('blockPin');
   if (!box) return;
   box.classList.toggle('visible', !!state.pinned);
-  document.getElementById('blockPinId').textContent = state.pinned ? state.pinned.blockId : '';
+  document.getElementById('blockPinId').textContent = pinnedRef();
+  document.getElementById('blockLinkBtn').textContent =
+    state.pinned && state.pinned.word ? '🔗 Ссылка на слово' : '🔗 Ссылка на блок';
 }
 
 // Над документом — закреплённый блок: его текст (и связанные значения)
 function focusPinned() {
   const p = state.pinned;
   if (!p) return;
+  if (p.word) {
+    state.relatedIds = [];
+    setFocus('Слово блока ' + p.blockId, p.word.text, []);
+    return;
+  }
   if (p.raw) {
     state.relatedIds = [];
     setFocus('Сырой JSON · ' + p.raw.id, p.raw.text, []);
@@ -2131,8 +2212,9 @@ function focusPinned() {
 function copyBlockLink() {
   const res = state.results[state.currentResFileIdx];
   if (!state.pinned || !res) return;
-  const url = viewLink(res.parse_id) + '&block=' + encodeURIComponent(state.pinned.blockId);
-  copyText(url, 'Ссылка на блок ' + state.pinned.blockId + ' скопирована');
+  const ref = pinnedRef();
+  const url = viewLink(res.parse_id) + '&block=' + encodeURIComponent(ref);
+  copyText(url, (state.pinned.word ? 'Ссылка на слово ' : 'Ссылка на блок ') + ref + ' скопирована');
 }
 
 function goToPage(idx) {
@@ -2200,7 +2282,20 @@ function blockNotFound(ref) {
 async function openBlock(parseId, ref) {
   ref = String(ref || '').trim().toLowerCase();
   const res = state.results[state.currentResFileIdx];
-  let m = ref.match(BLOCK_RE);
+  let m = ref.match(WORD_RE);
+  if (m) {
+    // Слово блока: p1-b42-w2 — закрепляем блок и выбираем в нём слово
+    const pd = pageDataOf(res, +m[1] - 1);
+    const blockId = `p${m[1]}-b${m[2]}`;
+    const seg = pd && (pd.segments.find(s => s.block_id === blockId) || pd.segments[+m[2]]);
+    const word = seg && segWords(pd, seg).find(w => w.id === ref);
+    if (!word) return blockNotFound(ref);
+    goToPage(pd.number - 1);
+    pinSegment(pd, seg, word);
+    scrollToBox(word.bbox);
+    return;
+  }
+  m = ref.match(BLOCK_RE);
   if (m) {
     const pd = pageDataOf(res, +m[1] - 1);
     const seg = pd && (pd.segments.find(s => s.block_id === ref) || pd.segments[+m[2]]);
@@ -2249,7 +2344,7 @@ function drawPinnedRaw(ctx, raw) {
 
 // Esc снимает закреплённый блок (во фрейме — раньше, чем закрыть фрейм)
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && state.pinned) { e.preventDefault(); unpinBlock(); }
+  if (e.key === 'Escape' && state.pinned) { e.preventDefault(); unpinStep(); }
 });
 
 // Наведение на блок — на любом из листов

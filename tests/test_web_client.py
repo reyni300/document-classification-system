@@ -102,6 +102,8 @@ class WebClientTest(unittest.TestCase):
         self.assertIn("get('block')", html)                      # /view?id=…&block=p1-b42
         self.assertIn('function copyBlockLink()', html)
         self.assertIn('function loadRaw(parseId)', html)          # блоки сырого JSON тоже
+        self.assertIn('function wordAt(pd, seg, event)', html)    # второй щелчок — слово блока
+        self.assertIn('const WORD_RE = /^p(\\d+)-b(\\d+)-w(\\d+)$/;', html)   # ссылка на слово
         with open(os.path.join(ROOT, 'embed-example', 'index.html'), encoding='utf-8') as f:
             self.assertIn("'&block='", f.read())                  # простая страница передаёт блок
 

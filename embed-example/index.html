@@ -108,8 +108,8 @@
 
   // ID разбора — 32 символа из цифр и букв a–f
   var ID_RE = /[0-9a-f]{32}/i;
-  // ID блока: p1-b42 (итоговый JSON) или p1-r3, p1-r3-l2, p1-r3-l2-w5 (сырой)
-  var BLOCK_RE = /^p\d+-(?:b\d+|r\d+(?:-l\d+(?:-w\d+)?)?)$/i;
+  // ID блока или слова: p1-b42, p1-b42-w2 (итоговый JSON) или p1-r3, p1-r3-l2, p1-r3-l2-w5 (сырой)
+  var BLOCK_RE = /^p\d+-(?:b\d+(?:-w\d+)?|r\d+(?:-l\d+(?:-w\d+)?)?)$/i;
   var params = new URLSearchParams(location.search);
 
   var serviceInput = document.getElementById('service');

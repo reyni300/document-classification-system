@@ -59,7 +59,7 @@ function extractParseId(text) {
 }
 
 // ID блока (p1-b42, p1-r3-l2-w5) из ссылки на блок: …/view?id=…&block=…
-const BLOCK_ID_RE = /^p\d+-(?:b\d+|r\d+(?:-l\d+(?:-w\d+)?)?)$/i;
+const BLOCK_ID_RE = /^p\d+-(?:b\d+(?:-w\d+)?|r\d+(?:-l\d+(?:-w\d+)?)?)$/i;
 function extractBlockId(text) {
   const raw = String(text || '').trim();
   if (BLOCK_ID_RE.test(raw)) return raw.toLowerCase();
