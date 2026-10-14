@@ -295,7 +295,10 @@
     box-shadow: none;
   }
   .vis-btn.switch.active::after { content: 'вкл'; color: #9cc0ff; }
-  .vis-btn.links-toggle.switch { padding: 9px 12px; font-size: 12px; font-weight: 600; }
+  .vis-btn.links-toggle.switch { padding: 7px 12px; font-size: 12px; font-weight: 600; }
+  .bar-toggles { flex: 0 0 auto; align-self: center; display: flex; flex-direction: column; gap: 6px; }
+  .bar-toggles .vis-btn { width: 100%; }
+  .bar-toggles .vis-btn.switch::after { margin-left: auto; }
 
   /* Закреплённый блок (щелчок по блоку или ссылка на блок) */
   .block-pin { display: none; align-items: center; gap: 6px; }
@@ -319,9 +322,14 @@
       <!-- Над документами: крупно текст блока под курсором (если на скане его
            не разглядеть) и ID разбора со ссылкой на результат -->
       <div class="parse-bar" id="parseBar">
-        <button class="vis-btn links-toggle switch" id="linksToggle" type="button"
-                onclick="toggleLinkedValues()" aria-pressed="false"
-                title="Включено: над документом текст вместе со связанными значениями. Выключено: только текст блока под курсором">Связанные значения</button>
+        <div class="bar-toggles">
+          <button class="vis-btn links-toggle switch" id="linksToggle" type="button"
+                  onclick="toggleLinkedValues()" aria-pressed="false"
+                  title="Включено: над документом текст вместе со связанными значениями. Выключено: только текст блока под курсором">Связанные значения</button>
+          <button class="vis-btn links-toggle switch" id="wordsToggle" type="button"
+                  onclick="toggleWordMode()" aria-pressed="false"
+                  title="Включено: на листе отдельные слова — наведение и щелчок работают со словом, ссылка ведёт на слово. Выключено: блоки целиком">По словам</button>
+        </div>
         <div class="focus-box" id="focusBox">
           <div class="focus-context" id="focusContext"></div>
           <div class="focus-text" id="focusText"><span class="focus-hint">Наведите на любой блок документа — здесь появится его текст</span></div>
@@ -333,8 +341,8 @@
           <div class="parse-bar-actions">
             <span class="block-pin" id="blockPin">
               <span class="block-pin-id" id="blockPinId" title="ID закреплённого блока"></span>
-              <button class="btn btn-secondary" id="blockLinkBtn" onclick="copyBlockLink()" title="Ссылка, по которой откроется этот разбор с выделенным блоком или словом. Щёлкните по закреплённому блоку ещё раз, чтобы выбрать в нём слово">🔗 Ссылка на блок</button>
-              <button class="btn btn-secondary" onclick="unpinStep()" title="Снять выделение (Esc): сначала слово, потом блок">✕</button>
+              <button class="btn btn-secondary" id="blockLinkBtn" onclick="copyBlockLink()" title="Ссылка, по которой откроется этот разбор с выделенным блоком или словом. Отдельные слова — переключатель «По словам»">🔗 Ссылка на блок</button>
+              <button class="btn btn-secondary" onclick="unpinStep()" title="Снять выделение (Esc)">✕</button>
             </span>
             <button class="btn btn-primary" onclick="copyParseLink()">⎘ Ссылка на результат</button>
           </div>
@@ -1341,6 +1349,22 @@ function rebuildOcrHitLayer() {
   // Есть блоки всего текста — зоны наведения по ним: каждый блок откликается
   sides.forEach(side => {
     if (!hasSegments(side.pd)) return;
+    if (state.wordMode) {
+      if (!(side.side === 'right' && !_rightTextVisible)) pageWords(side.pd).forEach(w => {
+        const s = scaleBlock(bboxToBlock(w.bbox));
+        const div = document.createElement('div');
+        div.className = 'ocr-hit';
+        div.style.left = (s.x - 1) + 'px'; div.style.top = (s.y - 1) + 'px';
+        div.style.width = (s.w + 2) + 'px'; div.style.height = (s.h + 2) + 'px';
+        div.dataset.word = w.id;
+        div.addEventListener('mouseenter', () => onWordEnter(side.pd, w));
+        div.addEventListener('mouseleave', () => onWordLeave());
+        div.addEventListener('click', () => togglePinWord(side.pd, w));
+        side.layer.appendChild(div);
+      });
+      side.mapping = null;
+      return;
+    }
     visibleSegments(side.pd, side.side).forEach(seg => {
       const s = scaleBlock(bboxToBlock(seg.bbox));
       const div = document.createElement('div');
@@ -1352,7 +1376,7 @@ function rebuildOcrHitLayer() {
       div.dataset.seg = seg.id;
       div.addEventListener('mouseenter', () => onSegmentEnter(side.side, seg.id));
       div.addEventListener('mouseleave', () => onSegmentLeave());
-      div.addEventListener('click', e => togglePinSegment(side.pd, seg.id, e));
+      div.addEventListener('click', () => togglePinSegment(side.pd, seg.id));
       side.layer.appendChild(div);
     });
     side.mapping = null;          // по полям зоны уже не нужны
@@ -1877,6 +1901,7 @@ function drawSegmentBlock(ctx, seg, solid, active) {
 }
 
 function drawSegmentsLayer(ctx, pd, links, solid, side) {
+  if (state.wordMode) { drawWordsLayer(ctx, pd, solid, side); return; }
   const segs = visibleSegments(pd, side);
   if (!segs.length && !pinnedOn(pd)) return;       // справа текст скрыт и закреплённого блока нет
   const active = activeSegmentIds(pd, links);
@@ -1924,9 +1949,9 @@ function toggleLinkedValues() {
 // Строка над документом. Когда «Связанные значения» выключены, выводится
 // только текст блока: без серой подписи (показатель, код, графа) и без
 // значений. Подсветка на листах от кнопки не зависит.
-function setFocus(context, text, values) {
-  state.lastFocus = [context, text, values];
-  if (!state.showLinks) { context = ''; values = []; }
+function setFocus(context, text, values, keepContext) {
+  state.lastFocus = [context, text, values, keepContext];
+  if (!state.showLinks) { if (!keepContext) context = ''; values = []; }
   const ctxEl = document.getElementById('focusContext');
   const txtEl = document.getElementById('focusText');
   const valEl = document.getElementById('focusValues');
@@ -2081,7 +2106,7 @@ function relatedForSegment(pd, seg) {
 
 // state.pinned: null | { page, blockId, segId, segIds, raw: null | { id, bbox, text },
 //                        word: null | { id, bbox, text } }
-// Первый щелчок по блоку закрепляет блок, второй — слово внутри него.
+// Щелчок закрепляет блок, а в режиме «По словам» — слово.
 state.pinned = null;
 
 const BLOCK_RE = /^p(\d+)-b(\d+)$/;
@@ -2111,25 +2136,6 @@ function segWords(pd, seg) {
 }
 function boxKey(b) { return [b.x, b.y, b.w, b.h].join(','); }
 
-// Слово блока под курсором: точка щелчка -> координаты листа
-function wordAt(pd, seg, event) {
-  const layer = event.currentTarget && event.currentTarget.parentElement;
-  if (!layer) return null;
-  const r = layer.getBoundingClientRect();
-  const x = (event.clientX - r.left) * state.imgNaturalW / r.width;
-  const y = (event.clientY - r.top) * state.imgNaturalH / r.height;
-  const words = segWords(pd, seg);
-  const inside = words.find(w => x >= w.bbox.x - 3 && x <= w.bbox.x + w.bbox.w + 3
-                                && y >= w.bbox.y - 3 && y <= w.bbox.y + w.bbox.h + 3);
-  if (inside) return inside;
-  // между словами — ближайшее по горизонтали
-  let best = null, dist = Infinity;
-  words.forEach(w => {
-    const d = Math.abs(x - (w.bbox.x + w.bbox.w / 2));
-    if (d < dist) { dist = d; best = w; }
-  });
-  return best;
-}
 const RAW_BLOCK_RE = /^p(\d+)-r\d+(?:-l\d+(?:-w\d+)?)?$/;
 
 // ID блока; у разбора, выгруженного до появления ID, — тот же по номеру
@@ -2137,20 +2143,88 @@ function segBlockId(pd, seg) { return seg.block_id || `p${pd.number}-b${seg.id}`
 function pinnedOn(pd) { return !!(state.pinned && pd && pd.number === state.pinned.page); }
 function isPinnedSeg(pd, seg) { return pinnedOn(pd) && state.pinned.segIds.includes(seg.id); }
 
-// Щелчок по блоку: блок не закреплён — закрепить блок; закреплён — выбрать
-// слово под курсором; щелчок по уже выбранному слову — снова весь блок.
-function togglePinSegment(pd, segId, event) {
+// Щелчок по блоку закрепляет его, повторный щелчок — снимает.
+// Отдельные слова — в режиме «По словам» (переключатель над документом).
+function togglePinSegment(pd, segId) {
   const seg = pd && pd.segments[segId];
   if (!seg) return;
-  const sameBlock = pinnedOn(pd) && !state.pinned.raw && state.pinned.segId === segId;
-  if (!sameBlock) { pinSegment(pd, seg); return; }
-  const word = event ? wordAt(pd, seg, event) : null;
-  if (!word || (state.pinned.word && state.pinned.word.id === word.id)) {
-    state.pinned.word = null;                       // назад к блоку целиком
-  } else {
-    state.pinned.word = word;
+  if (pinnedOn(pd) && !state.pinned.raw && !state.pinned.word && state.pinned.segId === segId) {
+    unpinBlock(); return;
   }
+  pinSegment(pd, seg);
+}
+
+// ── Режим «По словам» ──────────────────────────────────────────
+// На листах вместо блоков — отдельные слова. Наведение и щелчок работают со
+// словом, над документом его текст и ID (p1-b42-w2), ссылка ведёт на слово.
+state.wordMode = false;
+state.hoverWord = null;
+
+function toggleWordMode(on) {
+  state.wordMode = on === undefined ? !state.wordMode : !!on;
+  setSwitch('wordsToggle', state.wordMode);
+  state.hoverWord = null;
+  state.activeSegment = null; state.relatedIds = [];
+  // Закреплённое не переносится между режимами: слово -> его блок, блок снимается
+  if (state.pinned) {
+    if (!state.wordMode && state.pinned.word) {
+      const p = state.pinned;
+      state.pinned = p.segId != null ? { ...p, word: null, segIds: [p.segId] } : null;
+    } else if (state.wordMode && !state.pinned.word) {
+      state.pinned = null;
+    }
+  }
+  renderBlockPin();
+  if (state.pinned) focusPinned(); else setFocus('', '');
+  rebuildOcrHitLayer(); redrawCanvas(); redrawAnnotation();
+}
+
+// Все слова страницы с ID — по блокам, без повторов
+function pageWords(pd) {
+  if (!pd) return [];
+  if (!pd._pageWords) {
+    const seen = new Set();
+    pd._pageWords = [];
+    pd.segments.forEach(seg => segWords(pd, seg).forEach(w => {
+      if (seen.has(w.id)) return;
+      seen.add(w.id);
+      pd._pageWords.push({ ...w, kind: 'text', segId: seg.id, blockId: segBlockId(pd, seg) });
+    }));
+  }
+  return pd._pageWords;
+}
+
+function onWordEnter(pd, w) {
+  state.hoverWord = w.id;
+  setFocus('Слово ' + w.id, w.text, [], true);
+  redrawCanvas(); redrawAnnotation();
+}
+
+function onWordLeave() {
+  state.hoverWord = null;
+  redrawCanvas(); redrawAnnotation();
+  if (state.pinned) focusPinned(); else setFocus('', '');
+}
+
+function togglePinWord(pd, w) {
+  if (pinnedOn(pd) && state.pinned.word && state.pinned.word.id === w.id) { unpinBlock(); return; }
+  state.pinned = { page: pd.number, blockId: w.blockId, segId: w.segId, segIds: [], raw: null, word: w };
   renderBlockPin(); focusPinned(); redrawCanvas(); redrawAnnotation();
+}
+
+// Слова вместо блоков: остальные бледнее, если слово закреплено
+function drawWordsLayer(ctx, pd, solid, side) {
+  const hidden = side === 'right' && !_rightTextVisible;
+  const pinnedId = pinnedOn(pd) && state.pinned.word ? state.pinned.word.id : null;
+  const isActive = w => w.id === pinnedId || w.id === state.hoverWord;
+  const words = pageWords(pd);
+  if (!hidden) {
+    ctx.save();
+    if (pinnedId) ctx.globalAlpha = 0.3;
+    words.forEach(w => { if (!isActive(w)) drawSegmentBlock(ctx, w, solid, false); });
+    ctx.restore();
+  }
+  words.forEach(w => { if (isActive(w) && (!hidden || w.id === pinnedId)) drawSegmentBlock(ctx, w, solid, true); });
 }
 
 function pinSegment(pd, seg, word) {
@@ -2165,15 +2239,8 @@ function unpinBlock() {
   renderBlockPin(); setFocus('', ''); redrawCanvas(); redrawAnnotation();
 }
 
-// Esc и ✕: сначала снимают выбранное слово, потом блок
-function unpinStep() {
-  if (state.pinned && state.pinned.word) {
-    state.pinned.word = null;
-    renderBlockPin(); focusPinned(); redrawCanvas(); redrawAnnotation();
-  } else {
-    unpinBlock();
-  }
-}
+// Esc и ✕ снимают выделение
+function unpinStep() { unpinBlock(); }
 
 // ID того, на что ведёт ссылка: выбранное слово или весь блок
 function pinnedRef() {
@@ -2196,7 +2263,7 @@ function focusPinned() {
   if (!p) return;
   if (p.word) {
     state.relatedIds = [];
-    setFocus('Слово блока ' + p.blockId, p.word.text, []);
+    setFocus('Слово ' + p.word.id, p.word.text, [], true);
     return;
   }
   if (p.raw) {
@@ -2288,15 +2355,17 @@ async function openBlock(parseId, ref) {
     const pd = pageDataOf(res, +m[1] - 1);
     const blockId = `p${m[1]}-b${m[2]}`;
     const seg = pd && (pd.segments.find(s => s.block_id === blockId) || pd.segments[+m[2]]);
-    const word = seg && segWords(pd, seg).find(w => w.id === ref);
+    const word = seg && pageWords(pd).find(w => w.id === ref);
     if (!word) return blockNotFound(ref);
     goToPage(pd.number - 1);
-    pinSegment(pd, seg, word);
+    toggleWordMode(true);                    // ссылка на слово — сразу режим «По словам»
+    togglePinWord(pd, word);
     scrollToBox(word.bbox);
     return;
   }
   m = ref.match(BLOCK_RE);
   if (m) {
+    if (state.wordMode) toggleWordMode(false);
     const pd = pageDataOf(res, +m[1] - 1);
     const seg = pd && (pd.segments.find(s => s.block_id === ref) || pd.segments[+m[2]]);
     if (!seg) return blockNotFound(ref);

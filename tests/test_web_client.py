@@ -91,7 +91,7 @@ class WebClientTest(unittest.TestCase):
         html = self.page(self.make(), '/view')
         self.assertIn('state.showLinks = false;', html)          # «Связанные значения» выключены
         self.assertNotIn('dokanaliz.showLinks', html)            # и выбор не запоминается
-        for btn in ('linksToggle', 'btnToggleLeft', 'btnToggleLeftHighlight',
+        for btn in ('linksToggle', 'wordsToggle', 'btnToggleLeft', 'btnToggleLeftHighlight',
                     'btnToggleRight', 'btnToggleText'):
             self.assertRegex(html, r'class="vis-btn[^"]*switch[^"]*" id="%s"' % btn)
         self.assertIn('.preview-nav { position: sticky; top: 112px;', html)
@@ -102,7 +102,8 @@ class WebClientTest(unittest.TestCase):
         self.assertIn("get('block')", html)                      # /view?id=…&block=p1-b42
         self.assertIn('function copyBlockLink()', html)
         self.assertIn('function loadRaw(parseId)', html)          # блоки сырого JSON тоже
-        self.assertIn('function wordAt(pd, seg, event)', html)    # второй щелчок — слово блока
+        self.assertIn('function toggleWordMode(on)', html)        # «По словам» — отдельный переключатель
+        self.assertNotIn('function wordAt', html)                 # второго щелчка по блоку больше нет
         self.assertIn('const WORD_RE = /^p(\\d+)-b(\\d+)-w(\\d+)$/;', html)   # ссылка на слово
         with open(os.path.join(ROOT, 'embed-example', 'index.html'), encoding='utf-8') as f:
             self.assertIn("'&block='", f.read())                  # простая страница передаёт блок
